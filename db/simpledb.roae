@@ -1,0 +1,143 @@
+#Command:
+#    title = <non-Boolean expression>
+#    Parameters:
+#        <parameter list>
+#    Body:
+#        <SQL query (string block)>
+
+# <parameter list>:
+#    port - The port of the DBMS
+#    # Undocumented parameters:
+#    user
+#    password
+
+# See: O3.2-3: The DbSpec Executable Specification Language, Sec. 3.11 Interpolation in string blocks 
+# ...
+# As a partial solution to this problem, string blocks may also contain a second
+# form of interpolation:
+#     $${<non-Boolean expression>}
+# where we use two interpolation symbols in a row. Currently, this is only
+# supported for embedded SQL scripts. Using this notation in other string blocks
+# is undefined.
+# 
+# If an SQL script contains the second form of interpolation ($$), the
+# interpreter will create a PREPARED STATEMENT with question marks (?) at each
+# location and make a list of the expression values. Both are then sent to the
+# DMBS via the given database connection.
+# 
+# This way, one does not have to worry about quotation marks or strings interfering with
+# the SQL syntax. Example:
+# Execute via dbc:
+#     DELETE FROM Temp
+#     WHERE id <> $${user}
+#     AND counter > $${max};
+# This form of interpolation can only be used where the SQL interpreter would accept a
+# string or numeric literal, so writing "$${user}" (including the quotes) would be an error.
+
+# About PREPARED STATEMENT:
+# https://en.wikipedia.org/wiki/Prepared_statement
+# in sqlite3: https://visualstudiomagazine.com/articles/2014/03/01/sqlite-performance-and-prepared-statements.aspx
+
+# Sample queries:
+#select * from users;
+#select * from favourites;
+#select * from users,favourites where users.id == favourites.userid;
+#select * from users,favourites where users.id == favourites.userid and users.name like '%ben%';
+#select * from users,favourites where users.id == favourites.userid and users.name == 'Bender';
+#select * from users,favourites where users.id == favourites.userid and favourites.favourite like '%blue%';
+
+#---0
+Command:
+    title = "Get all users in the database"
+    Parameters:
+    Body:
+        SELECT * from users;
+
+#---1
+
+Command:
+    title = "Get table 'favourites' with some weird restrictions (d1>0 or d1<d2 and d1!=d3)"
+    Parameters:
+        dummy1
+        dummy2 - second dummy
+        dummy3 - third dummy
+    Body:
+        SELECT * from favourites where
+                   $${dummy1} >  0
+               or  $${dummy1} <  $${dummy2}
+               and $${dummy1} <> $${dummy3};
+#---2+3
+
+Command:
+    title = "Get all users' favourites"
+    Parameters:
+    Body:
+        SELECT * from users,favourites where users.id == favourites.userid;
+Command: 
+    title = "Get the favourites of a given user by his/her name but not being superman"
+    Parameters:
+        username - user's name
+    Body:
+        SELECT * from users,favourites
+        WHERE users.id == favourites.userid
+              AND users.name == $${username}
+              AND $${username} <> 'superman';
+
+#-------------------------------------
+#=====================================
+
+# Some bad formed records:
+#--- bad - 1
+
+Command:
+    title = "Get the favourites of a given user"
+    Parameters:
+#--- bad - 2
+
+Command:
+    title = "Get the favourites of a given user"
+    Body:
+        SELECT * from users,favourites
+        WHERE users.id == favourites.userid
+              AND users.name == $${username};
+#---4
+
+Command:
+    title = "Do nothing at all"
+    Parameters:
+        username - user's name
+    Body:
+Command:#--- bad - 3
+    Body:
+    Parameters:
+
+#=====================================
+#-------------------------------------
+
+# Good ones again:
+#---5
+
+Command:
+    title = "Get the favourites of a given userid"
+    Parameters:
+        userid - user's id
+        dummy
+    Body:
+        SELECT * from users,favourites
+        WHERE users.id == favourites.userid
+              AND users.id == $${userid};
+
+#---6
+Command:
+    title = "Get the users whith a favourite matching the first parameter"
+    Parameters:
+        favourite - any favourite thing; can have "sql like" wilcards eg. '%cake%' 
+    Body:
+        SELECT * from users,favourites
+        WHERE users.id == favourites.userid
+              AND ( favourites.thing LIKE $${favourite}
+                    OR favourites.favourite LIKE $${favourite} )
+
+
+#-------------------------------------
+#=====================================

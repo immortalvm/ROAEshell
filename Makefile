@@ -1,9 +1,10 @@
+IDABUILDDIRPREFIX:=$(if $(IDABUILDDIRPREFIX),$(IDABUILDDIRPREFIX),.)
 ifeq ($(HOST),ivm64)
     CC=ivm64-gcc
     CXX=ivm64-g++
     IVM_AS:=$(or $(IVM_AS), ivm64-as --noopt)
     IVM_EMU:=$(or $(IVM_EMU), ivm64-emu)
-    BUILDDIR=./run-$(HOST)
+    BUILDDIR:=$(IDABUILDDIRPREFIX)/run-$(HOST)
     MAKEMINIZIP=Makefile-$(HOST)
     IVMLDFLAGS=-Xlinker -mbin
     XMLCONFOPT=--without-pic
@@ -15,13 +16,15 @@ else
     CXX=g++
     IVM_AS=
     IVM_EMU=
-    BUILDDIR=./run-linux
+    BUILDDIR=$(IDABUILDDIRPREFIX)/run-linux
     MAKEMINIZIP=Makefile
     IVMLDFLAGS=
     XMLCONFOPT=
     IVM_FSGEN=true
     IVMFS=
 endif
+#RSYNC=rsync
+RSYNC=true
 
 CDEFFLAGS=
 CXXDEFFLAGS=
@@ -67,14 +70,14 @@ roaeshell: $(ALIBS) $(BUILDDIR)/ivmfs.c libspawn.c $(REQSRC) shell.c
 	@echo; echo; test -f "$(BUILDDIR)/$@"  && echo "Run as: (cd $(BUILDDIR); ./$@)"
 
 $(LIBDIR)/libtinyxml2.a:
-	-rsync -Pa --delete $(IDAEXTSIARD2SQLDIR)/thirdparty/tinyxml2/ $(THIRDPARTYTINYXML2DIR)/
+	-$(RSYNC) -Pa --delete $(IDAEXTSIARD2SQLDIR)/thirdparty/tinyxml2/ $(THIRDPARTYTINYXML2DIR)/
 	@mkdir -p $(BUILDDIR) || exit -1
 	@mkdir -p $(LIBDIR)   || exit -1
 	$(CXX) $(CXXFLAGS) -I$(THIRDPARTYTINYXML2DIR) -c $(THIRDPARTYTINYXML2DIR)/tinyxml2.cpp -o $(BUILDDIR)/tinyxml2.o
 	ar r $@ $(BUILDDIR)/tinyxml2.o
 
 $(LIBDIR)/libz.a:
-	-rsync -Pa --delete $(IDAEXTSIARD2SQLDIR)/thirdparty/zlib/ $(THIRDPARTYLIBZDIR)/
+	-$(RSYNC) -Pa --delete $(IDAEXTSIARD2SQLDIR)/thirdparty/zlib/ $(THIRDPARTYLIBZDIR)/
 	@mkdir -p $(LIBDIR) || exit -1
 	+cd $(THIRDPARTYLIBZDIR) && rm -rf build; mkdir -p build; cd build; CFLAGS="$(CFLAGS)" CC=$(CC) ../configure --static; CFLAGS="$(CFLAGS)" CC=$(CC) make
 	@cp -v `find $(THIRDPARTYLIBZDIR)/build -name libz.a` "$@"
@@ -85,23 +88,23 @@ $(LIBDIR)/libminizip.a: $(LIBDIR)/libz.a
 	@cp -v `find $(THIRDPARTYLIBZDIR)/contrib/minizip -name libminizip.a` "$@"
 
 $(LIBDIR)/libsqlite3.a:
-	-rsync -Pa --delete $(IDAEXTSQLITEDIR)/*.[ch] $(IDAEXTSQLITEDIR)/Makefile* $(IDAEXTSQLITEDIR)/build.sh $(IDAEXTSQLITEDIR)/README* $(THIRDPARTYSQLITE3DIR)/
+	-$(RSYNC) -Pa --delete $(IDAEXTSQLITEDIR)/*.[ch] $(IDAEXTSQLITEDIR)/Makefile* $(IDAEXTSQLITEDIR)/build.sh $(IDAEXTSQLITEDIR)/README* $(THIRDPARTYSQLITE3DIR)/
 	@mkdir -p $(LIBDIR) || exit -1
 	+cd $(THIRDPARTYSQLITE3DIR) && make sqlite_lib
 	@cp -v `find $(THIRDPARTYSQLITE3DIR) -name libsqlite3.a` "$@"
 
 $(LIBDIR)/libroae.a:
-	-rsync -Pa --delete $(IDAEXTROAEDIR)/*.[ch]*  $(IDAEXTROAEDIR)/README*  $(IDAEXTROAEDIR)/build.sh  $(IDAEXTROAEDIR)/Makefile $(IDAROAEPARSERDIR)/
+	-$(RSYNC) -Pa --delete $(IDAEXTROAEDIR)/*.[ch]*  $(IDAEXTROAEDIR)/README*  $(IDAEXTROAEDIR)/build.sh  $(IDAEXTROAEDIR)/Makefile $(IDAROAEPARSERDIR)/
 	@mkdir -p $(BUILDDIR) || exit -1
 	@mkdir -p $(LIBDIR)   || exit -1
 	+cd $(IDAROAEPARSERDIR) && ./build.sh -c && HOST=$(HOST) make libroae
 	@cp -v `find $(IDAROAEPARSERDIR) -name libroae.a` "$@"
 
 $(LIBDIR)/libsiard2sql.a:
-	-rsync -Pa --delete $(IDAEXTSIARD2SQLDIR)/*.[ch]*  $(IDAEXTSIARD2SQLDIR)/README*  $(IDAEXTSIARD2SQLDIR)/build.sh  $(IDAEXTSIARD2SQLDIR)/Makefile $(IDASIARD2SQLDIR)/
+	-$(RSYNC) -Pa --delete $(IDAEXTSIARD2SQLDIR)/*.[ch]*  $(IDAEXTSIARD2SQLDIR)/README*  $(IDAEXTSIARD2SQLDIR)/build.sh  $(IDAEXTSIARD2SQLDIR)/Makefile $(IDASIARD2SQLDIR)/
 	@mkdir -p $(BUILDDIR) || exit -1
+	+export IDABUILDDIRPREFIX=. ; cd $(IDASIARD2SQLDIR) && make cleanbuild && HOST=$(HOST) THIRDPARTYDIR=$(THIRDPARTYDIR) make libsiard2sql
 	@mkdir -p $(LIBDIR)   || exit -1
-	+cd $(IDASIARD2SQLDIR) && make cleanbuild && HOST=$(HOST) THIRDPARTYDIR=$(THIRDPARTYDIR) make libsiard2sql
 	@cp -v `find $(IDASIARD2SQLDIR) -name libsiard2sql.a` "$@"
 
 #$(LIBDIR)/%.a: $(IDAEXTSIARD2SQLDIR)/$(LIBDIR)/%.a

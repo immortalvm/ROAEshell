@@ -28,7 +28,10 @@
 #include <ctype.h>
 #include <glob.h>
 
-#define ROAESHELL_VERSION "v0.1.7 (2023120500)"
+#define ROAESHELL_VERSION "v0.1.8 (2024022600)"
+
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #ifdef __ivm64__
 extern int ivm_spawn(int argc, char *argv[]);
@@ -57,6 +60,11 @@ extern int ivm_spawn(int argc, char *argv[]);
     #endif
     #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
     #endif
+#endif
+
+#ifdef __ivm64__
+#define getline __getline
+#define getdelim __getdelim
 #endif
 
 #define MAX_LINE 4*4096 /* chars per line, per command, should be enough. */
@@ -647,10 +655,19 @@ static int main_mkdirat(int argc, char *argv[])
     return 0;
 }
 
-/* recursive rm (like rm -rf) */
-static int rrm(char *path)
+// Recursive rm (like rm -rf)
+// To be safer, only path whose realpath contains needle are deleted
+static int rrm_needle(char *path, char *needle)
 {
     if (!path || !*path) return 0; // Null or empty string: do nothing
+
+    if (needle) {
+        // Do nothing if the path does not have the needle
+        // (this is checked only in the first recursive invocation)
+        char fullpath[PATH_MAX];
+        realpath(path, fullpath); fullpath[PATH_MAX-1]='\0';
+        if (!strstr(fullpath, needle)) return 0;
+    }
 
     char d[PATH_MAX];
     strcpy(d, path);
@@ -693,7 +710,7 @@ static int rrm(char *path)
             struct dirent *dd = files[k];
             // Ignore . and .. , to avoid infinite recursion
             if (strcmp(dd->d_name, ".") && strcmp(dd->d_name, "..")) {
-                status |= rrm(dd->d_name);
+                status |= rrm_needle(dd->d_name, NULL);
             }
             free(dd);
         }
@@ -710,6 +727,12 @@ static int rrm(char *path)
 
     free(files);
     return 0;
+}
+
+
+static int rrm(char *path)
+{
+    return rrm_needle(path, NULL);
 }
 
 // To test unlink
@@ -2105,6 +2128,88 @@ static int main_source(int argc, char *argv[])
         return -1;
 }
 
+static int main_ioctl(int argc, char *argv[])
+{
+    if (argc < 4) {
+        printf("Usage: %s fd cmd lflag\n",argv[0]);
+        printf("  Call ioctl(fd, cmd, tty), with tty->c_lflag=lflag\n");
+        printf("  fd (dec), file no.:\n\t STDIN=0, STDOUT=1, STDERR=2 by default\n");
+        printf("  cmd (hex), one of:\n\t TCGETS = %#x  TCSETS = %#x  TCSETSW = %#x  TCSETSF = %#x\n", TCGETS, TCSETS, TCSETSW, TCSETSF); 
+        printf("  lflag (hex), OR-ed of:\n\t ECHO = %#x  ICANON = %#x\n", ECHO, ICANON); 
+        return -1;
+    }
+
+    int fd = atoi(argv[1]);
+    int cmd = strtol(argv[2], NULL, 16);
+    int lflag = strtol(argv[3], NULL, 16);
+
+    struct termios t;
+    // Read current termios
+    int res = ioctl(fd, TCGETS, &t);
+
+    if (res == 0) { // ioctl returns 0 if OK (no errors) 
+        res = -1;
+        if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
+            // Set o unset flag echo
+            if (lflag & ECHO) 
+                t.c_lflag |= ECHO;
+            else
+                t.c_lflag &= ~ECHO;
+            // Set o unset flag icanon 
+            if (lflag & ICANON) 
+                t.c_lflag |= ICANON;
+            else
+                t.c_lflag &= ~ICANON;
+            // Set terminal attributes 
+            res = ioctl(fd, cmd, &t);
+        } 
+        else if (cmd == TCGETS) {
+            fprintf(stdout, "lflags=%#x echo=%d icanon=%d\n", t.c_lflag, t.c_lflag & ECHO, t.c_lflag & ICANON);
+            res = 0; // if we are here previous TCGETS was ok
+        }
+    }
+
+    return res;
+}
+
+static int main_stty(int argc, char *argv[])
+{
+    if (argc < 2) {
+        printf("Usage: %s -a        # show current attributyes\n",argv[0]);
+        printf("       %s [-]echo   # set/unset(-) echo\n",argv[0]);
+        printf("       %s [-]icanon # set/unset(-) icanon mode\n",argv[0]);
+        return -1;
+    }
+
+    struct termios t;
+    if (tcgetattr(fileno(stdin), &t)) {    // Read current termios
+        perror("tcgetattr");
+        return -1;
+    }
+    argv++;
+    if (!strcmp(*argv, "-a")){
+        fprintf(stdout, "%secho %sicanon\n", (t.c_lflag & ECHO)?"":"-", (t.c_lflag & ICANON)?"":"-");
+        return 0;
+    }
+
+    do {
+        if (!strcmp(*argv, "echo")){
+            t.c_lflag |= ECHO;
+        } else if (!strcmp(*argv, "-echo")){
+            t.c_lflag &= ~ECHO;
+        } else if (!strcmp(*argv, "icanon")){
+            t.c_lflag |= ICANON;
+        } else if (!strcmp(*argv, "-icanon")){
+            t.c_lflag &= ~ICANON;
+//t.c_cc[VTIME] = 0;
+//t.c_cc[VMIN] = 1;
+        } else {
+            fprintf(stderr,"unknown option: %s\n", *argv);
+            return -1;
+        }
+    } while (*++argv);
+    return tcsetattr(fileno(stdin), TCSANOW, &t);
+}
 
 // Tree from https://github.com/kddnewton/tree
 typedef struct {
@@ -2331,7 +2436,7 @@ extern int IDA_SQLITE_do_meta_command(char *cmd);
 extern int IDA_SQLITE_shell_exec(char *cmd);
 extern int IDA_SQLITE_run(char *cmd);
 
-#define SQLBUFFSIZE 4096
+#define SQLBUFFSIZE 4096*2
 static void sqlite_shell_init(){
     static long sqlite_shell_initialized = 0;
     if (!sqlite_shell_initialized){
@@ -2362,8 +2467,12 @@ static void help_sqlite(int argc, char *argv[]) {
     printf("              # equivalent to unzip + convert siard->sql + clear + read sql\n");
     printf("       %s -- tables\n",argv[0]);
     printf("              # equivalent to \"ANALYZE main; select * from sqlite_stat1;\"\n");
+    printf("              # this show not empty tables; a table with multiple indexed may appear once per index\"\n");
     printf("       %s -- table_info <table_name>\n",argv[0]);
     printf("              # equivalent to \"SELECT * FROM pragma_table_info('<table_name>');\"\n");
+    printf("       %s -- bytes \n",argv[0]);
+    printf("              # print the size of current database\n");
+    printf("              # equivalent to \"SELECT P.page_count*S.page_size FROM pragma_page_count() AS P, pragma_page_size() AS S;\"\n");
 }
 static int main_sqlite(int argc, char *argv[]) {
     if (argc < 2) {
@@ -2408,15 +2517,19 @@ static int main_sqlite(int argc, char *argv[]) {
             if (!wd) return -1;
             
             // Create tmp dir, chdir to it and unzip siard
-            char *tmpdir = "/tmp/_sqlite3_load_siard_tmp_";
-            char *sqlfile = "_tmp_out_.sql";
-            mkdir("/tmp", 0777); mkdir(tmpdir, 0777);
+            #define TMPDIR_SIARD2SQL "_roaesh_ld_siard_tmp_" 
+            char *tmpdir = "/tmp/" TMPDIR_SIARD2SQL;
+            char *sqlfile = "_out_siard2sql_tmp_.sql";
+            rmkdir(tmpdir, 0777);
             if (!chdir(tmpdir)) {
+
+                int trydir = 0;
                 int uz = IDA_unzip(realsiard, NULL);
                 if (uz) {
                     chdir(wd);
-                    fprintf(stderr, "Cannot unzip file '%s'\n", realsiard);
-                    return -1;
+                    fprintf(stderr, "Cannot unzip file '%s'; trying as a directory ...\n", realsiard);
+                    trydir = 1;
+                    //return -1;
                 }
 
                 // Convert siard -> sql
@@ -2425,7 +2538,13 @@ static int main_sqlite(int argc, char *argv[]) {
                 char *filter = ""; // To be get as parameter
                 if (argv[4]) filter = argv[4];
                 unlink(sqlfile);
-                int sqlerr = IDA_siard2sql(tmpdir, sqlfile, filter);
+                int sqlerr = 1;
+                if (!trydir) {
+                    sqlerr = IDA_siard2sql(tmpdir, sqlfile, filter);
+                } else {
+                    // Perhaps is a dir with an already unzipped siard
+                    sqlerr = IDA_siard2sql(realsiard, sqlfile, filter);
+                }
                 if (sqlerr) {
                     chdir(wd);
                     fprintf(stderr, "Error converting to SQL\n");
@@ -2447,7 +2566,8 @@ static int main_sqlite(int argc, char *argv[]) {
 
             chdir(wd); // Restore dir
 
-            // TODO: delete temporary dir safe and recursively
+            // delete temporary dir safely and recursively
+            rrm_needle(tmpdir, TMPDIR_SIARD2SQL);
 
             fprintf(stderr, "done\n");
         }
@@ -2462,6 +2582,10 @@ static int main_sqlite(int argc, char *argv[]) {
             }
             snprintf(buff, SQLBUFFSIZE, "SELECT * FROM pragma_table_info('%s');", argv[3]);
             buff[SQLBUFFSIZE-1]='\0';
+            IDA_SQLITE_shell_exec(buff);
+        }
+        else if (!strcmp(argv[2], "bytes")){
+            strcpy(buff, "SELECT P.page_count*S.page_size FROM pragma_page_count() AS P, pragma_page_size() AS S;");
             IDA_SQLITE_shell_exec(buff);
         }
     }
@@ -2602,7 +2726,7 @@ static int main_help(int argc, char *argv[])
            "   exit(=quit)(=^D) fcd find free fstat ftruncate getenv glob help ls lseek lsof lstat\n"
            "   mkdir mkdirat mkstemp mkdtemp mv open openat opendir prompt pwd\n"
            "   read readlink readlinkat realpath rename renameat rm(=unlink) rmdir seekdir\n"
-           "   setenv source spawn stat symlink(=ln) symlinkat touch tree truncate\n"
+           "   setenv source spawn stat stty symlink(=ln) symlinkat touch tree truncate\n"
            "   type unlinkat unsetenv write writef\n"
            "Available redirections:\n"
            "   '> file', '2> file', '>> file', '< file'\n"
@@ -2642,6 +2766,16 @@ int main(void)
     puts("");
 
     char currwd[PATH_MAX];
+
+    // Termios tty configuration, use ICANON|ECHO if the tty
+    // where running this program has not ICANON nor ECHO.
+    struct termios tty;
+    ioctl(STDIN_FILENO, TCGETS, &tty);
+    tty.c_lflag |= ICANON | ECHO;     // enable emulation of icanon and echo
+    //tty.c_lflag &= ~ICANON & ~ECHO; // disable emulation of icanon and echo
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 0;
+    ioctl(STDIN_FILENO, TCSETS, &tty);
 
 	while (1)   /* Program terminates normally inside get_command() after ^D is typed*/
 	{   		
@@ -3041,6 +3175,16 @@ int main(void)
 
         if (!strcmp("source", args[0])|| !strcmp(".", args[0])){
             status = main_source(argc, args);
+            continue;
+        }
+
+        if (!strcmp("ioctl", args[0])){
+            status = main_ioctl(argc, args);
+            continue;
+        }
+
+        if (!strcmp("stty", args[0])){
+            status = main_stty(argc, args);
             continue;
         }
 

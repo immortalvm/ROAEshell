@@ -56,7 +56,7 @@ Command:
 #---1
 
 Command:
-    title = "Get table 'favourites' with some weird restrictions (d1>0 or d1<d2 and d1!=d3)"
+    title = "Get table 'favourites' with some weird restrictions (d1>0 or (d1<d2 and d1!=d3))"
     Parameters:
         dummy1
         dummy2 - second dummy
@@ -64,8 +64,8 @@ Command:
     Body:
         SELECT * from favourites where
                    $${dummy1} >  0
-               or  $${dummy1} <  $${dummy2}
-               and $${dummy1} <> $${dummy3};
+               or  ($${dummy1} <  $${dummy2}
+                    and $${dummy1} <> $${dummy3});
 #---2+3
 
 Command:
@@ -74,14 +74,14 @@ Command:
     Body:
         SELECT * from users,favourites where users.id == favourites.userid;
 Command: 
-    title = "Get the favourites of a given user by his/her name but not being superman"
+    title = "Get the favourites of a user by his/her name (case insensitive) but not being superman"
     Parameters:
         username - user's name
     Body:
         SELECT * from users,favourites
         WHERE users.id == favourites.userid
-              AND users.name == $${username}
-              AND $${username} <> 'superman';
+              AND upper(users.name) == upper($${username})
+              AND upper($${username}) <> 'SUPERMAN';
 
 #-------------------------------------
 #=====================================
@@ -131,7 +131,7 @@ Command:
 Command:
     title = "Get the users whith a favourite matching the first parameter"
     Parameters:
-        favourite - any favourite thing; can have "sql like" wilcards eg. '%cake%' 
+        favourite - any favourite thing; can have "sql like" wilcards eg. '%ap%' 
     Body:
         SELECT * from users,favourites
         WHERE users.id == favourites.userid

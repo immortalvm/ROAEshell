@@ -1,0 +1,156 @@
+#Command:
+#    title = <non-Boolean expression>
+#    Parameters:
+#        <parameter list>
+#    Body:
+#        <SQL query (string block)>
+
+# <parameter list>:
+#    port - The port of the DBMS
+#    # Undocumented parameters:
+#    user
+#    password
+
+# See: O3.2-3: The DbSpec Executable Specification Language, Sec. 3.11 Interpolation in string blocks 
+# ...
+# As a partial solution to this problem, string blocks may also contain a second
+# form of interpolation:
+#     $${<non-Boolean expression>}
+# where we use two interpolation symbols in a row. Currently, this is only
+# supported for embedded SQL scripts. Using this notation in other string blocks
+# is undefined.
+# 
+# If an SQL script contains the second form of interpolation ($$), the
+# interpreter will create a PREPARED STATEMENT with question marks (?) at each
+# location and make a list of the expression values. Both are then sent to the
+# DMBS via the given database connection.
+# 
+# This way, one does not have to worry about quotation marks or strings interfering with
+# the SQL syntax. Example:
+# Execute via dbc:
+#     DELETE FROM Temp
+#     WHERE id <> $${user}
+#     AND counter > $${max};
+# This form of interpolation can only be used where the SQL interpreter would accept a
+# string or numeric literal, so writing "$${user}" (including the quotes) would be an error.
+
+# About PREPARED STATEMENT:
+# https://en.wikipedia.org/wiki/Prepared_statement
+# in sqlite3: https://visualstudiomagazine.com/articles/2014/03/01/sqlite-performance-and-prepared-statements.aspx
+
+# Sample queries:
+#select * from users;
+#select * from favourites;
+#select * from users,favourites where users.id == favourites.userid;
+#select * from users,favourites where users.id == favourites.userid and users.name like '%ben%';
+#select * from users,favourites where users.id == favourites.userid and users.name == 'Bender';
+#select * from users,favourites where users.id == favourites.userid and favourites.favourite like '%blue%';
+
+#---
+Command:
+    title = "Get a list of tables in the database"
+    Parameters:
+    Body:
+        ANALYZE main; SELECT tbl, stat FROM sqlite_stat1 GROUP BY tbl ORDER BY tbl;
+#---
+Command:
+    title = "Get a list of indexes in the database"
+    Parameters:
+    Body:
+        ANALYZE main; SELECT idx, tbl, stat FROM sqlite_stat1 ORDER BY idx,stat;
+
+#---
+Command:
+    title = "Show SIARD encoding rules"
+    Parameters:
+    Body:
+        SELECT * FROM siard_encoding;
+
+
+#---
+Command:
+    title = "Print the contents, the number of chars and bytes of the table with small texts"
+    Parameters:
+    Body:
+         SELECT s.comments, s.string, hex(s.string),
+         length(s.string) AS chars,                
+         length(cast(s.string as blob)) AS bytes   
+         FROM smalltext AS s      
+#---
+Command:
+    title = "Print the contents, the number of chars and bytes of the table with BLOBs"
+    Parameters:
+    Body:
+         SELECT l.comments, l.string, hex(l.string),
+         length(l.string) AS chars,                
+         length(cast(l.string as blob)) AS bytes   
+         FROM largetext AS l;      
+
+#---
+Command:
+    title = "Use this query to compare in hexadecimal the text contents of both tables with BLOBs and smalltext together with their sizes"  
+    Parameters:
+    Body:  	    	 
+        SELECT hex(s.string), length(s.string) AS slen,   
+          length(cast(s.string as blob))       AS sbyte,        
+          hex(l.string), length(l.string)      AS llen,        
+          length(cast(l.string as blob))       AS lbyte,        
+          s.comments FROM smalltext as s, largetext as l  
+          WHERE s.id == l.id ;   
+
+#---
+Command:
+    title = "Select all rows in table `smalltext`"
+    Parameters:
+    Body: 
+         SELECT * FROM smalltext;
+
+#---
+Command:
+    title = "Select all rows in table `smalltext` filtering by needle (to use only with 'roae run-replace' !!)"
+    Parameters:
+        needle - filter by this string using "LIKE '%<needle>%'"
+    Body: 
+         SELECT * FROM smalltext
+                  WHERE (id LIKE '%$${needle}%') 
+                    OR (string LIKE '%$${needle}%')
+                    OR (comments LIKE '%$${needle}%');
+
+#---
+Command:
+    title = "Select all rows in table `smalltext` filtering by needle (to use only with 'roae run-bind' !!)"
+    Parameters:
+        needle - filter by this string using "LIKE '%<needle>%'"
+    Body: 
+         SELECT * FROM smalltext
+                  WHERE (id       LIKE '%' || $${needle} || '%') 
+                     OR (string   LIKE '%' || $${needle} || '%')
+                     OR (comments LIKE '%' || $${needle} || '%');
+#---
+Command:
+    title = "Select all rows in table `largetext`"
+    Parameters:
+    Body: 
+         SELECT * FROM largetext;
+
+#---
+Command:
+    title = "Select all rows in table `largetext` filtering by needle (to use only with 'roae run-replace' !!)"
+    Parameters:
+        needle - filter by this string using "LIKE '%<needle>%'"
+    Body: 
+         SELECT * FROM largetext
+                  WHERE (id LIKE '%$${needle}%') 
+                    OR (string LIKE '%$${needle}%')
+                    OR (comments LIKE '%$${needle}%');
+
+#---
+Command:
+    title = "Select all rows in table `largetext` filtering by needle (to use only with 'roae run-bind' !!)"
+    Parameters:
+        needle - filter by this string using "LIKE '%<needle>%'"
+    Body: 
+         SELECT * FROM largetext
+                  WHERE (id       LIKE '%' || $${needle} || '%') 
+                     OR (string   LIKE '%' || $${needle} || '%')
+                     OR (comments LIKE '%' || $${needle} || '%');

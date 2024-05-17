@@ -23,8 +23,10 @@ else
     IVMFS=
 endif
 
-CFLAGS := $(if $(CFLAGS), $(CFLAGS), -O2 -static)
-CXXFLAGS := $(if $(CXXFLAGS), $(CXXFLAGS), -O2 -static)
+CDEFFLAGS=-O2
+CXXDEFFLAGS=-O2
+CFLAGS := $(if $(CFLAGS), $(CFLAGS), $(CDEFFLAGS))
+CXXFLAGS := $(if $(CXXFLAGS), $(CXXFLAGS), $(CXXDEFFLAGS))
 
 LIBDIR=$(BUILDDIR)/lib
 

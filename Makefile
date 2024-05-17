@@ -23,11 +23,10 @@ else
     IVM_FSGEN=true
     IVMFS=
 endif
-#RSYNC=rsync
 RSYNC=true
 
-CDEFFLAGS=
-CXXDEFFLAGS=
+CDEFFLAGS=-O2
+CXXDEFFLAGS=-O2
 CFLAGS := $(if $(CFLAGS), $(CFLAGS), $(CDEFFLAGS))
 CXXFLAGS := $(if $(CXXFLAGS), $(CXXFLAGS), $(CXXDEFFLAGS))
 
@@ -84,7 +83,7 @@ $(LIBDIR)/libz.a:
 
 $(LIBDIR)/libminizip.a: $(LIBDIR)/libz.a
 	@mkdir -p $(LIBDIR) || exit -1
-	cd $(THIRDPARTYLIBZDIR)/contrib/minizip; make clean; CFLAGS="$(CFLAGS) -Dmain=_IDA_miniunz_main_" CC=$(CC) make libminizip.a
+	+cd $(THIRDPARTYLIBZDIR)/contrib/minizip; make clean; CXXFLAGS="$(CXXFLAGS)" CFLAGS="$(CFLAGS) -Dmain=_IDA_miniunz_main_" CXX=$(CXX) CC=$(CC) make libminizip.a
 	@cp -v `find $(THIRDPARTYLIBZDIR)/contrib/minizip -name libminizip.a` "$@"
 
 $(LIBDIR)/libsqlite3.a:

@@ -585,7 +585,7 @@ extern "C" {
     // strings (in argv format) with the values to be replaced in a prepared
     // sql statement, in the correct order and repeated if necessary
     // Return NULL if something is wrong
-    char** IDA_ROAE_bind_command(long nc, char *values[], ...)
+    char** IDA_ROAE_command_bind_list(long nc, char *values[])
     {
         ROAE_command cmd;
         try {
@@ -625,6 +625,95 @@ extern "C" {
         return bind_list;
     }
 
+    // Given a list of values to be bind (in argv format) generate the
+    // sequence of sqlite commands to bind those values
+    // This function allocates the returned string that needs to be freed
+    char* IDA_ROAE_command_bind_list_to_sqlite(char *bind_list[])
+    {
+        long i=0;
+        string sqlite_command;
+        if (bind_list) {
+            sqlite_command += ".parameter clear\n"; // Separate with \n
+            while (bind_list[i]) {
+                sqlite_command += ".parameter set ?" + to_string(i + 1) + " " + bind_list[i] + "\n";
+                i++;
+            }
+        }
+        if (sqlite_command.empty()){
+            return NULL;
+        } else {
+            return strdup(sqlite_command.c_str());
+        }
+    }
+
+    // Get the title of the nc-th command; in case of error, return NULL
+    // Note that the returned string must be deallocated
+    char* IDA_ROAE_get_command_title(long nc)
+    {
+        try {
+           return strdup(ROAEcl.command(nc).get_title().c_str());
+        } catch (std::exception &e) {
+            cerr << e.what() << endl;
+            return NULL;
+        }
+    }
+
+    // Return true if the title of the nc-th command match the regexp string r
+    int IDA_ROAE_command_title_match(long nc, char* r)
+    {
+        try {
+            regex re(r);
+            cmatch cm; // Match char*
+            const char *s = ROAEcl.command(nc).get_title().c_str();
+            if (std::regex_search(s, cm, re)) {
+                return 1;
+            } else {
+                return 0;
+            }
+        } catch (std::exception &e) {
+            cerr << e.what() << endl;
+            return 0;
+        }
+    }
+
+    // Get the number of arguments of the nc-th command; in case of error, return -1
+    long IDA_ROAE_get_command_nargs(long nc)
+    {
+        try {
+            return ROAEcl.command(nc).count_params();
+        } catch (std::exception &e) {
+            cerr << e.what() << endl;
+            return -1;
+        }
+    }
+
+    // Get na-th argument's name of the nc-th command; in case of error, return NULL
+    // Note that the returned string must be deallocated
+    char* IDA_ROAE_get_command_arg_name(long nc, long na)
+    {
+        try {
+            string argn = ROAEcl.command(nc).get_param(na).name;
+            return strdup(argn.c_str());
+        } catch (std::exception &e) {
+            cerr << e.what() << endl;
+            return NULL;
+        }
+    }
+
+    // Get na-th argument's comments of the nc-th command; in case of error, return NULL
+    // Note that the returned string must be deallocated
+    char* IDA_ROAE_get_command_arg_comment(long nc, long na)
+    {
+        try {
+            string argn = ROAEcl.command(nc).get_param(na).comment;
+            return strdup(argn.c_str());
+        } catch (std::exception &e) {
+            cerr << e.what() << endl;
+            return NULL;
+        }
+    }
+
+
 /* C API tests */
 
 static void test_cpp(char *roaefile) {
@@ -661,6 +750,7 @@ static void test_cpp(char *roaefile) {
 
     // Print the number of parsed commands
     long ncommands = RCL.count();
+    cout << "------------------" << endl;
     cout << endl << "Found " << ncommands << " roae commands" << endl;
 
     // Dumping the list of command found (if the list is short)
@@ -674,11 +764,14 @@ static void test_cpp(char *roaefile) {
         label:
         srand(rand() + (unsigned long)&&label);
         long r = rand() % ncommands;
-        cout << endl << "**** Printing one command randomly: the " << r << "-th one out of " << ncommands << ":" << endl;
+        cout << "------------------" << endl;
+        cout << endl
+             << "Printing one command randomly: the " << r << "-th one out of " << ncommands << ":" << endl;
         // Testing the constructor without arguments
         // it must access the same list, as it is static
         ROAE_command_list RCL2;
         cout << RCL2.command(r) << endl;
+        cout << "------------------" << endl;
     }
 
     // Clear the static list of commands
@@ -692,10 +785,11 @@ static void test_c(char *roaefile){
     printf("Found %ld roae commands in file '%s'\n",
             ncommands, roaefile);
 
-    // Print a random command of the list 
     if (ncommands > 0) {
+        // Print a random command of the list
         srand(time(NULL) + (unsigned long)test_c);
         long r = rand() % ncommands;
+        printf("\n-----------------\n");
         printf("*** Printing one command randomly: the %ld-th one, out of %ld\n", r, ncommands);
         IDA_ROAE_print_command(r);
 
@@ -713,15 +807,77 @@ static void test_c(char *roaefile){
         }
 
         char request[2048];
-        IDA_ROAE_eval_command(r, request, sizeof(request), values);
-        if (request) {
+        char *ec = IDA_ROAE_eval_command(r, request, sizeof(request), values);
+        if (ec) {
             printf("Evaluated SQL: '%s'\n", request);
         } else {
             fprintf(stderr, "Error evaluating '%s' for command number %ld (perhaps command number out of range)", request, r);
         }
 
-    }
+        printf("\n-----------------\n");
 
+        // Print a menu to select a rule
+        printf("\nMenu:\n");
+        for (long i=0; i<ncommands; i++){
+            char *c = IDA_ROAE_get_command_title(i);
+            printf(" [%02ld] %s\n", i, c);
+            free(c);
+        };
+
+        #define ROAEBUFFSIZE 2048
+        char menubuff[ROAEBUFFSIZE];
+        errno=0;
+        long nc=0, scnf=0;
+        printf("Intro one command: ");
+        char *roae = fgets(menubuff, ROAEBUFFSIZE-1, stdin); menubuff[ROAEBUFFSIZE-1]='\0';
+        if (roae) scnf = sscanf(roae, "%ld", &nc);
+        if (!errno && scnf>0 && nc>=0 && nc<ncommands){
+            printf("Selected ROAE command no. %ld\n", nc);
+            char *c = IDA_ROAE_get_command_title(nc);
+            printf("  title=%s\n", c);
+            free(c);
+            long npar = IDA_ROAE_get_command_nargs(nc);
+            char **arglist;
+            arglist = (char**)malloc(sizeof(char*) * (npar+1));
+            if (npar > 0) {
+                printf("  This rule requires %ld arguments:\n", npar);
+                for (long k=0; k<npar; k++){
+                    char* arg_name = IDA_ROAE_get_command_arg_name(nc, k);
+                    char* arg_comment = IDA_ROAE_get_command_arg_comment(nc, k);
+                    printf("   - Intro argument '%s' (%s): ", arg_name, arg_comment);
+                    free(arg_name);
+                    free(arg_comment);
+                    char *arg = fgets(menubuff, ROAEBUFFSIZE-1, stdin);
+                    menubuff[ROAEBUFFSIZE-1]='\0';
+                    if ('\n' == menubuff[strlen(menubuff)-1]) menubuff[strlen(menubuff)-1] = '\0'; // Remove last newline
+                    if (arg)
+                        arglist[k] = strdup(arg);
+                    else
+                        arglist[k] = NULL;
+                }
+            } else {
+                printf("  This rule does not requires any parameter\n");
+            }
+            arglist[npar] = NULL;
+
+            char **bindarglist = IDA_ROAE_command_bind_list(nc, arglist);
+            char* evalcmd = IDA_ROAE_eval_command(nc, NULL, 0, arglist);
+            fprintf(stdout, "Evaluated command: '%s'\n", evalcmd);
+            if (evalcmd) free(evalcmd);
+
+            char *bindsqlite = IDA_ROAE_command_bind_list_to_sqlite(bindarglist);
+            fprintf(stdout, "SQLite bind-command:\n'%s'\n", bindsqlite);
+            if (bindsqlite) free(bindsqlite);
+            printf("\n-----------------\n");
+
+            #define FREEARGS(args)  do{long i=0; if (args){ while(args[i]){free(args[i]);i++;}; free(args);}}while(0)
+            if (arglist) FREEARGS(arglist);
+            if (bindarglist) FREEARGS(bindarglist);
+
+        } else {
+            fprintf(stderr, "ROAE command number is not a valid integer (0 <= n < %ld)\n", ncommands);
+        }
+    }
 }
 
 void ROAE_test(char *roaefile) {

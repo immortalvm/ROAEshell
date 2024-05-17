@@ -31,23 +31,41 @@ This is the public C API provided by the roaeparser library:
 
 ```c
 // Load a ROAE file and return the number of commands found
-long IDA_ROAE_load(char *filename)
+long IDA_ROAE_load(char *filename);
     
 // Delete the current roae command list
-void IDA_ROAE_clear()
+void IDA_ROAE_clear();
     
 // Print the list of commands
-void IDA_ROAE_print_commands()
+void IDA_ROAE_print_commands();
     
 // Get the number of commands
-long IDA_ROAE_count()
+long IDA_ROAE_count();
     
 // Print the nc-th command
-void IDA_ROAE_print_command(long nc)
+void IDA_ROAE_print_command(long nc);
+
+// Get the title of the nc-th command; in case of error, return NULL
+// Note that the returned string must be deallocated
+char* IDA_ROAE_get_command_title(long nc);
+
+// Return true if the title of the nc-th command match the regexp string r
+int IDA_ROAE_command_title_match(long nc, char* r);
+
+// Get the number of arguments of the nc-th command; in case of error, return -1
+long IDA_ROAE_get_command_nargs(long nc);
+
+// Get na-th argument's name of the nc-th command; in case of error, return NULL
+// Note that the returned string must be deallocated
+char* IDA_ROAE_get_command_arg_name(long nc, long na);
+
+// Get na-th argument's comments of the nc-th command; in case of error, return NULL
+// Note that the returned string must be deallocated
+char* IDA_ROAE_get_command_arg_comment(long nc, long na);
 
 // Print the lis of commands whose title
 // match the regexp s
-void IDA_ROAE_search(char *re)
+void IDA_ROAE_search(char *re);
     
 // Eval the nc-th command with a list of nparams parameters 
 // The list of parameter values is in the argv format (last element must be NULL).
@@ -55,13 +73,19 @@ void IDA_ROAE_search(char *re)
 // If buff==NULL, a dynamic array of chars is allocated with the size of
 // the evaluated command in this case, the programmer must free it after its use
 // Return NULL if error.
-char* IDA_ROAE_eval_command(long nc, char *buff, long buffsize, char *values[])
+char* IDA_ROAE_eval_command(long nc, char *buff, long buffsize, char *values[]);
 
 // Given a list of values in argv format for parameters, return a list of
 // strings (in argv format) with the values to be replaced in a prepared
 // sql statement, in the correct order and repeated if necessary
 // Return NULL if something is wrong
-char** IDA_ROAE_bind_command(long nc, char *values[], ...)
+// This function allocates the returned structure that needs to be freed
+char** IDA_ROAE_command_bind_list(long nc, char *values[]);
+
+// Given a list of values to be bind (in argv format) generate the
+// sequence of sqlite commands to bind those values
+// This function allocates the returned string that needs to be freed
+char* IDA_ROAE_command_bind_list_to_sqlite(char *bind_list[]);
  ```
     
 ## References 

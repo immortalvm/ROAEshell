@@ -27,8 +27,9 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <glob.h>
+#include <stdint.h>
 
-#define ROAESHELL_VERSION "v0.1.8 (2024022600)"
+#define ROAESHELL_VERSION "v0.1.9 (2024050200)"
 
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -105,25 +106,28 @@ static int prompt = 2;
 // For a valid redirection, a blank space is required before and after
 // redirection operators '<' or '>'.
 // --------------------------------------------------------------
-static void parse_redirections(char **args,  int *argc, char **file_in, char **file_out, char **file_out_append, char **file_err){
+static void parse_redirections(char **args,  int *argc, char **file_in, char **file_out, char **file_out_append, char **file_err, char **file_in_heredoc){
     *file_in = NULL;
     *file_out = NULL;
     *file_out_append = NULL;
     *file_err = NULL;
+    *file_in_heredoc = NULL;
     char **args_start = args;
     while (*args) {
         int is_in = !strcmp(*args, "<");
         int is_out = !strcmp(*args, ">");
         int is_out_append = !strcmp(*args, ">>");
         int is_err = !strcmp(*args, "2>");
-        if (is_in || is_out || is_err || is_out_append) {
+        int is_in_heredoc = !strcmp(*args, "<<");
+        if (is_in || is_out || is_err || is_out_append || is_in_heredoc) {
             args++;
             if (*args){
                 (*argc) -= 2;
-                if (is_in)  *file_in = *args;
-                if (is_out) *file_out = *args;
-                if (is_out_append) *file_out_append = *args;
+                if (is_in)  {*file_in = *args; *file_in_heredoc = NULL;}
+                if (is_out) {*file_out = *args; *file_out_append = NULL;}
+                if (is_out_append) {*file_out = NULL; *file_out_append = *args;}
                 if (is_err) *file_err = *args;
+                if (is_in_heredoc) {*file_in = NULL; *file_in_heredoc = *args;}
                 char **aux = args + 1;
                 while (*aux) {
                    *(aux-2) = *aux;
@@ -141,6 +145,35 @@ static void parse_redirections(char **args,  int *argc, char **file_in, char **f
         }
     }
 }
+
+static int is_same_inode(int fd1, int fd2)
+{
+    struct stat s1, s2;
+    int e1, e2;
+    e1 = fstat(fd1, &s1);
+    e2 = fstat(fd2, &s2);
+    if (!e1 && !e2){
+        if (s1.st_ino == s2.st_ino) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int is_same_file(const char *f1, const char *f2)
+{
+    struct stat s1, s2;
+    int e1, e2;
+    e1 = stat(f1, &s1);
+    e2 = stat(f2, &s2);
+    if (!e1 && !e2){
+        if (s1.st_ino == s2.st_ino) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 
 // -----------------------------------------------------------------------
 //  get_command() reads in the next command line, separating it into distinct tokens
@@ -323,6 +356,19 @@ static void replace_status(int argc, char *argv[], int status)
     }
 }
 
+static void replace_env(int argc, char *argv[])
+{
+    for (int i=0; i < argc; i++) {
+        if ('$' == argv[i][0] && '\0' != argv[i][1]) {
+            char *e = getenv(&argv[i][1]);
+            if (e)
+                 argv[i] = e;
+            else
+                 argv[i] = "";
+        }
+    }
+}
+
 static void ignore_comments(int *argc, char *argv[])
 {
     int nargs = *argc;
@@ -373,6 +419,12 @@ static ssize_t COPY(int ifd, int ofd)
     char buf[BUFSIZ];
     ssize_t ret = 0;
     ssize_t rlen;
+
+    if ((!isatty(ifd) || !isatty(ofd)) && is_same_inode(ifd, ofd)){
+        fprintf(stderr, "input file is output file\n");
+        return 1;
+    }
+
     while ((rlen = READ(ifd, buf, BUFSIZ)) > 0) {
         for (ssize_t off = 0; off < rlen; off += WRITE(ofd, buf+off, rlen-off));
         ret += rlen;
@@ -635,6 +687,17 @@ static int main_getenv(int argc, char *argv[])
     return 0;
 }
 
+static int main_env(int argc, char *argv[])
+{
+    extern char **environ;
+    int i=0;
+    while (environ[i] && i<(1<<24)){
+        printf("%s\n", environ[i]);
+        i++;
+    }
+    return 0;
+}
+
 
 static int main_mkdirat(int argc, char *argv[])
 {
@@ -665,8 +728,8 @@ static int rrm_needle(char *path, char *needle)
         // Do nothing if the path does not have the needle
         // (this is checked only in the first recursive invocation)
         char fullpath[PATH_MAX];
-        realpath(path, fullpath); fullpath[PATH_MAX-1]='\0';
-        if (!strstr(fullpath, needle)) return 0;
+        char* rl = realpath(path, fullpath); fullpath[PATH_MAX-1]='\0';
+        if (!rl || !strstr(fullpath, needle)) return 0;
     }
 
     char d[PATH_MAX];
@@ -901,6 +964,16 @@ static int copyat(int dirorigfd, char *orig, int dirdestfd, char *dest)
     int fdi, fdo;
 
     fdi = openat(dirorigfd, orig, O_RDONLY);
+
+    int fdro = openat(dirdestfd, dest, O_RDONLY);
+    if (fdro > 0 && is_same_inode(fdi, fdro)){
+        // Check in read-only if they are the same file to not overwrite destination
+        fprintf(stderr, "input file is output file\n");
+        close(fdro);
+        return -10;
+    }
+    close(fdro);
+
     if (fdi == -1) return -3;
     fdo = openat(dirdestfd, dest, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fdo == -1) {
@@ -1160,6 +1233,9 @@ static int main_open(int argc, char *argv[])
     int fid = open(pathname, flags, 0777);
     if (-1 != fid){
         printf("File '%s' opened fid=%d (flags=%#x)\n", pathname, fid, flags);
+        char ans[33];
+        sprintf(ans, "%i", fid);
+        setenv("ans", ans, 1);
     } else {
         perror("open");
         printf("Opening file or dir '%s' FAILED!\n", pathname);
@@ -1181,6 +1257,9 @@ static int main_openat(int argc, char *argv[])
     int fid = openat(dirfd, pathname, O_RDWR);
     if (-1 != fid){
         printf("File '%s' @ dirfd=%d opened fid=%d\n", pathname, dirfd, fid);
+        char ans[33];
+        sprintf(ans, "%i", fid);
+        setenv("ans", ans, 1);
     } else {
         printf("Opening regular file '%s' @ dirfd=%d FAILED!\n", pathname, dirfd);
         perror("openat");
@@ -1219,6 +1298,9 @@ static int main_opendir(int argc, char *argv[])
     DIR *d = opendir(pathname);
     if (d){
         printf("Directory '%s' opened fid=%d\n", pathname, dirfd(d));
+        char ans[33];
+        sprintf(ans, "%i", dirfd(d));
+        setenv("ans", ans, 1);
     } else {
         printf("Opening dir '%s' FAILED!\n", pathname);
         perror("opendir");
@@ -1808,7 +1890,7 @@ static int main_countargs(int argc, char **args){
 
 
 /* recursive du (like du -s) */
-static int rdu(char *path)
+static unsigned long rdu(char *path)
 {
     if (!path || !*path) return 0; // Null or empty string: do nothing
 
@@ -1840,13 +1922,13 @@ static int rdu(char *path)
     if (!w) { perror("getcwd"); return -1; }
 
     // Count size of children recursively
-    long size = 0;
+    unsigned long size = 0;
     if (chdir(d) == 0) {
         for (long k=0; k<nfiles; k++){
             struct dirent *dd = files[k];
             // Ignore . and .. , to avoid infinite recursion
             if (strcmp(dd->d_name, ".") && strcmp(dd->d_name, "..")) {
-                long dsize = rdu(dd->d_name);
+                unsigned long dsize = rdu(dd->d_name);
                 size += dsize;
             }
             free(dd);
@@ -1867,7 +1949,7 @@ static int main_du(int argc, char *argv[]) {
         printf("Usage: %s <dir_name> \n",argv[0]);
         return -1;
     }
-    long size = rdu(argv[1]);
+    unsigned long size = rdu(argv[1]);
     printf("%ld (%.2f%sB)\n", size, HUMANSIZE(size), HUMANPREFIX(size));
     return 0;
 }
@@ -2060,6 +2142,7 @@ static int main_source(int argc, char *argv[])
                 sprintf(buff, "# preamble ===========\n"
                               "dup2 %d 1 -silent \n"
                               "dup2 %d 2 -s \n"
+                              //"lsof; echo end preamble----- \n"
                               "#=====================\n",
                                source_stdout_fileno0, source_stderr_fileno0);
                 int nw = write(tmpfd, buff, strlen(buff));
@@ -2074,7 +2157,8 @@ static int main_source(int argc, char *argv[])
                 // line separated by semicolons, because once STDIN_FILENO is
                 // restored (dup2), no more reads are possible from the copy of
                 // the script
-                sprintf(buff, "# epilogue ===========\n"
+                sprintf(buff, "\n# epilogue ===========\n"
+                              //"echo begin_epilogue -----; lsof \n"
                               "dup2 %d 0 -s ;"
                               "close %d  > /tmp/null 2> /tmp/null ;"
                               "close %d  > /tmp/null 2> /tmp/null ;"
@@ -2126,6 +2210,44 @@ static int main_source(int argc, char *argv[])
         close(source_stdout_fileno0);
         close(source_stderr_fileno0);
         return -1;
+}
+
+// Support for implementing heredoc redirection (" << TOKEN"): read from stdin
+// until a line with only "TOKEN" is found, write it to a temporary file; if
+// everything is ok return the descriptor to the open temporary file;
+// otherwise return -1 
+static int heredoc_open(char* token)
+{
+    mkdir("/tmp", 0777);
+    int tmpfd = open("/tmp/", O_TMPFILE | O_RDWR, 0777);
+    int hderror = 0;
+    if (tmpfd >= 0) {
+        char *lineptr = NULL;
+        ssize_t n = 0, nr, nw;
+        long endlen = strlen(token);
+        while ( (nr = getline(&lineptr, &n, stdin)) > 0) {
+            // Do not check final EOL 
+            int end = !strncmp(token, lineptr, endlen)
+                && ('\0' == lineptr[endlen] || '\n' == lineptr[endlen]);
+            if (end) {
+                free(lineptr);
+                break;}
+            else {
+                nw = write(tmpfd, lineptr, nr);
+                if (nw != nr) {hderror = 1; break;}
+                free(lineptr);
+                lineptr=NULL; n=0;   // Prepare next getline
+            }
+        }
+        //fflush(stdin); // getline() may have read chars in advance letting them in the buffer
+        lseek(tmpfd, 0, SEEK_SET);
+        if (!hderror) return tmpfd;
+        else {
+            close(tmpfd);
+            return -1;
+        }
+    }
+    return -1;
 }
 
 static int main_ioctl(int argc, char *argv[])
@@ -2209,6 +2331,80 @@ static int main_stty(int argc, char *argv[])
         }
     } while (*++argv);
     return tcsetattr(fileno(stdin), TCSANOW, &t);
+}
+
+// CRC32 from https://gist.github.com/timepp/1f678e200d9e0f2a043a9ec6b3690635
+//
+// usage: the following code generates crc for 2 pieces of data
+// uint32_t table[256];
+// crc32_generate_table(table);
+// uint32_t crc = crc32_update(table, 0, data_piece1, len1);
+// crc = crc32_update(table, crc, data_piece2, len2);
+// output(crc);
+
+static uint32_t crc32_table[256];
+static void crc32_generate_table(uint32_t* table)
+{
+    uint32_t polynomial = 0xEDB88320;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (size_t j = 0; j < 8; j++) {
+            if (c & 1) {
+                c = polynomial ^ (c >> 1);
+            }
+            else {
+                c >>= 1;
+            }
+        }
+        table[i] = c;
+    }
+}
+
+static uint32_t crc32_update(uint32_t* table, uint32_t initial, const void* buf, size_t len)
+{
+    uint32_t c = initial ^ 0xFFFFFFFF;
+    const uint8_t* u = (const uint8_t*)(buf);
+    for (size_t i = 0; i < len; ++i) {
+        c = crc32_table[(c ^ u[i]) & 0xFF] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+static uint32_t crc32_compute(const char* filename, int *err)
+{
+    errno =0;
+    *err = 1;
+    static int do_table = 1;
+    if (do_table){
+        crc32_generate_table(crc32_table);
+        do_table = 0;
+    }
+    uint32_t crc = 0;
+    int fh = open(filename, O_RDONLY);
+    if (fh>=0) {
+        uint8_t buff[256];
+        ssize_t r = 1;
+        while ( 0 < (r = read(fh, buff, 256))) {
+            crc = crc32_update(crc32_table, crc, buff, r);
+        }
+        close(fh);
+        if (!errno) {
+            *err = 0;
+        }
+    }
+    return crc;
+}
+
+static int main_crc32(int argc, char *argv[])
+{
+    if (argc < 2) {
+        printf("Compute the CRC32 hash of a file.\nUsage:\n");
+        printf("       %s <filename>\n", argv[0]);
+        return -1;
+    }
+    int err = 1;
+    uint32_t crc = crc32_compute(argv[1], &err);
+    if (!err) printf("%08x\n", crc);
 }
 
 // Tree from https://github.com/kddnewton/tree
@@ -2431,10 +2627,16 @@ int main_unzip(int argc, char *argv[]) {
     return IDA_unzip(argv[1], NULL);
 }
 
+// Init sqlite shell
 extern void IDA_SQLITE_shell_init();
+// Run an internal sqlite command, that is, those that start with "."
 extern int IDA_SQLITE_do_meta_command(char *cmd);
+// Run an SQL command
 extern int IDA_SQLITE_shell_exec(char *cmd);
+// Run an internal command or SQL command depending on whether it starts with "."
 extern int IDA_SQLITE_run(char *cmd);
+// Run an sequence of internal or SQL commands separated by "\n" (without blanks) 
+extern int IDA_SQLITE_run_sequence(char *cmd);
 
 #define SQLBUFFSIZE 4096*2
 static void sqlite_shell_init(){
@@ -2467,7 +2669,7 @@ static void help_sqlite(int argc, char *argv[]) {
     printf("              # equivalent to unzip + convert siard->sql + clear + read sql\n");
     printf("       %s -- tables\n",argv[0]);
     printf("              # equivalent to \"ANALYZE main; select * from sqlite_stat1;\"\n");
-    printf("              # this show not empty tables; a table with multiple indexed may appear once per index\"\n");
+    printf("              # this shows non-empty tables; a table with multiple indexed may appear once per index\"\n");
     printf("       %s -- table_info <table_name>\n",argv[0]);
     printf("              # equivalent to \"SELECT * FROM pragma_table_info('<table_name>');\"\n");
     printf("       %s -- bytes \n",argv[0]);
@@ -2522,15 +2724,14 @@ static int main_sqlite(int argc, char *argv[]) {
             char *sqlfile = "_out_siard2sql_tmp_.sql";
             rmkdir(tmpdir, 0777);
             if (!chdir(tmpdir)) {
-
                 int trydir = 0;
-                int uz = IDA_unzip(realsiard, NULL);
-                if (uz) {
-                    chdir(wd);
-                    fprintf(stderr, "Cannot unzip file '%s'; trying as a directory ...\n", realsiard);
-                    trydir = 1;
-                    //return -1;
-                }
+                //int uz = IDA_unzip(realsiard, NULL);
+                //if (uz) {
+                //    chdir(wd);
+                //    fprintf(stderr, "Cannot unzip file '%s'; trying as a directory ...\n", realsiard);
+                //    trydir = 1;
+                //    //return -1;
+                //}
 
                 // Convert siard -> sql
                 fprintf(stderr, "\n");
@@ -2539,14 +2740,14 @@ static int main_sqlite(int argc, char *argv[]) {
                 if (argv[4]) filter = argv[4];
                 unlink(sqlfile);
                 int sqlerr = 1;
-                if (!trydir) {
-                    sqlerr = IDA_siard2sql(tmpdir, sqlfile, filter);
-                } else {
+                //if (!trydir) {
+                //    sqlerr = IDA_siard2sql(tmpdir, sqlfile, filter);
+                //} else {
                     // Perhaps is a dir with an already unzipped siard
                     sqlerr = IDA_siard2sql(realsiard, sqlfile, filter);
-                }
+                //}
                 if (sqlerr) {
-                    chdir(wd);
+                    int d_ = chdir(wd);
                     fprintf(stderr, "Error converting to SQL\n");
                     return -1;
                 }
@@ -2564,7 +2765,7 @@ static int main_sqlite(int argc, char *argv[]) {
             snprintf(buff, SQLBUFFSIZE, ".read \"%s\"", sqlfile);
             IDA_SQLITE_do_meta_command(buff);
 
-            chdir(wd); // Restore dir
+            int d_ = chdir(wd); // Restore dir
 
             // delete temporary dir safely and recursively
             rrm_needle(tmpdir, TMPDIR_SIARD2SQL);
@@ -2595,17 +2796,25 @@ static int main_sqlite(int argc, char *argv[]) {
     return 0;
 }
 
-extern long IDA_ROAE_load(char *filename);
-extern void IDA_ROAE_clear();
-extern void IDA_ROAE_print_commands();
-extern void IDA_ROAE_print_command(long nc);
-extern void IDA_ROAE_search(char *re);
-extern long IDA_ROAE_count();
+extern long  IDA_ROAE_load(char *filename);
+extern void  IDA_ROAE_clear();
+extern void  IDA_ROAE_print_commands();
+extern void  IDA_ROAE_print_command(long nc);
+extern void  IDA_ROAE_search(char *re);
+extern long  IDA_ROAE_count();
+extern char* IDA_ROAE_get_command_title(long nc);
+extern long  IDA_ROAE_get_command_nargs(long nc);
+extern char* IDA_ROAE_get_command_arg_name(long nc, long na);
+extern char* IDA_ROAE_get_command_arg_comment(long nc, long na);
 extern char* IDA_ROAE_eval_command(long nc, char *buff, long buffsize, char *values[]);
-extern char** IDA_ROAE_bind_command(long nc, char *values[], ...);
-#define ROAEBUFFSIZE 1024
+extern char**IDA_ROAE_command_bind_list(long nc, char *values[], ...);
+extern char* IDA_ROAE_command_bind_list_to_sqlite(char *bind_list[]);
 
-static void help_roae(int argc, char *argv[]) {
+#define ROAEBUFFSIZE (1024*16)
+#define FREEARGS(args)  do{long i=0; if (args){ while(args[i]){free(args[i]);i++;}; free(args);}}while(0)
+
+static void help_roae(int argc, char *argv[])
+{
     printf("Usage: %s load filename \n",argv[0]);
     printf("       %s clear \n",argv[0]);
     printf("       %s list\n",argv[0]);
@@ -2614,9 +2823,130 @@ static void help_roae(int argc, char *argv[]) {
     printf("       %s run-replace <command_number> param0 param1 ...\n",argv[0]);
     printf("              Replace parameters in body, then execute  \n");
     printf("              Use sqlite types for parameters, e.g.: 123, 'string', X'f09f8dba'\n");
+    printf("              Note that the replacement is literal, therefore strings need quotes\n");
     printf("       %s run-bind <command_number> param0 param1 ...\n",argv[0]);
     printf("              Prepare SQL statement, bind parameters, then execute  \n");
+    printf("              Note that quotes are not required for strings on using binding\n");
+    printf("       %s menu\n", argv[0]);
+    printf("              Choose interactively a roae rule from a list,\n");
+    printf("              then select the execution method (replace/bind, see above), and enter parameters\n");
+    printf("              SQL statement is prepared, parameters replaced or bound, and executed\n");
+    printf("              Do not forget to load first the ROAE file and its associated DB\n");
+    printf("              Example:\n");
+    printf("                      sqlite -- loadsiard example.siard\n");
+    printf("                      roae load example.roae\n");
 }
+
+static void roae_menu()
+{
+    long ncommands = IDA_ROAE_count();
+    // Print a menu with all roae commands 
+    if (ncommands <= 0) {
+        fprintf(stderr, "No ROAE commands available\nA ROAE file and its associated DB must be loaded first\n");
+        fprintf(stderr, "Example:\n\t sqlite -- loadsiard example.siard\n\t roae load example.roae\n");
+        return;
+    }
+
+    long nc, scnf;
+    char menubuff[ROAEBUFFSIZE];
+    while (1) { 
+        printf("\nAvailable ROAE cases:\n");
+        for (long i=0; i<ncommands; i++){
+            char *c = IDA_ROAE_get_command_title(i);
+            printf(" [%02ld] %s\n", i, c);
+            free(c);
+        };
+        printf(" [%02ld] QUIT\n", ncommands); // #ncommands is to quit the selection loop
+
+        // Select a ROAE command
+        nc=0; scnf=0;
+        printf("Select ROAE command number: ");
+        char *roae = fgets(menubuff, ROAEBUFFSIZE-1, stdin); menubuff[ROAEBUFFSIZE-1]='\0';
+        if (roae) scnf = sscanf(roae, "%ld", &nc);
+        if (scnf>0 && nc>=0 && nc<=ncommands){
+            if (nc == ncommands) {
+                // Quit from the selection loop
+                printf(" QUIT selected ... quitting ...\n\n");
+                break;
+            }
+            printf("  selected ROAE command no. %ld\n", nc);
+            char *c = IDA_ROAE_get_command_title(nc);
+            printf("  title=%s\n", c);
+            free(c);
+
+            printf("Select evaluation method (Replace/Bind)[R]: ");
+            char *meth = fgets(menubuff, ROAEBUFFSIZE-1, stdin);
+            if (!meth || *meth == 'B' || *meth == 'b') meth = "B";
+            else meth = "R";  // Replace evaluation method by default
+
+            // Read the required arguments from stdin
+            long npar = IDA_ROAE_get_command_nargs(nc);
+            char **arglist = NULL;
+            arglist = (char**)malloc(sizeof(char*) * (npar+1));
+            if (arglist) {
+                if (npar > 0) {
+                    printf("ROAE rule #%ld requires %ld parameters:\n", nc, npar);
+                    for (long k=0; k<npar; k++){
+                        char* arg_name = IDA_ROAE_get_command_arg_name(nc, k);
+                        char* arg_comment = IDA_ROAE_get_command_arg_comment(nc, k);
+                        printf("  - Enter parameter #%ld '%s' (%s): ", k+1, arg_name, arg_comment);
+                        free(arg_name);
+                        free(arg_comment);
+                        char *arg = fgets(menubuff, ROAEBUFFSIZE-1, stdin);
+                        menubuff[ROAEBUFFSIZE-1] = '\0';
+                        if ('\n' == menubuff[strlen(menubuff)-1]) menubuff[strlen(menubuff)-1] = '\0'; // Remove last newline
+                        if (arg) {
+                            arglist[k] = strdup(arg);
+                        } else {
+                            arglist[k] = NULL;
+                        }
+                    }
+                } else {
+                    printf("This rule does not requires any parameter\n");
+                }
+                arglist[npar] = NULL;
+            } else {
+                printf("Error allocating memory for parameters\n");
+                return;
+            }
+
+            char *ec = NULL;
+            printf("-----------\n");
+            if (*meth == 'B') {
+                // Method of evaluation: run-bind
+                // Create the list of sqlite commands with parameters to bind
+                char **bind_list = IDA_ROAE_command_bind_list(nc, arglist);
+                // Create a string with the sqlite command sequence to bind parameters
+                // and execute it
+                char *bl = IDA_ROAE_command_bind_list_to_sqlite(bind_list);
+                if (bl) {
+                    printf("Binding parameters:\n-----------\n%s\n----------\n", bl);
+                    IDA_SQLITE_run_sequence(bl);
+                    free(bl);
+                } 
+                ec = IDA_ROAE_eval_command(nc, NULL, 0, NULL);
+                if (bind_list) FREEARGS(bind_list);
+            } else {
+                // Method of evaluation: run-replace
+                ec = IDA_ROAE_eval_command(nc, NULL, 0, arglist);
+            }  
+
+            if (ec) {
+                printf("Evaluated command:\n-----------\n%s\n----------\n", ec);
+                IDA_SQLITE_shell_exec(ec);
+            } else {
+                fprintf(stderr, "Error evaluating command #%ld\n", nc);
+            }
+            if (ec) free(ec);
+            if (arglist) FREEARGS(arglist);
+            
+        } else {
+            fprintf(stderr, "ROAE command number is not a valid integer (0 <= n < %ld)\n", ncommands);
+            break;
+        }
+    }
+}
+
 static int main_roae(int argc, char *argv[]) {
     static long ncommands = 0;
     if (argc < 2) {
@@ -2668,14 +2998,16 @@ static int main_roae(int argc, char *argv[]) {
         long i = 0;
         strcpy(buff, ".parameter clear");
         IDA_SQLITE_do_meta_command(buff);
-        char **bind_list = IDA_ROAE_bind_command(nc, &argv[3]);
-        while (bind_list && bind_list[i] != NULL){
-            snprintf(buff, ROAEBUFFSIZE, ".parameter set ?%ld %s", i+1, bind_list[i]);
-            printf("%s\n", buff);
-            IDA_SQLITE_do_meta_command(buff);
-            free(bind_list[i]);
-            i++;
-        }
+        // List of parameters to bind
+        char **bind_list = IDA_ROAE_command_bind_list(nc, &argv[3]);
+        // Sqlite sequence to bind parameters
+        char *bl = IDA_ROAE_command_bind_list_to_sqlite(bind_list);
+        fprintf(stderr, "bind list:\n--\n%s\n--\n", bl);
+        if (bl) {
+            IDA_SQLITE_run_sequence(bl);
+            free(bl);
+        } 
+        if (bind_list) FREEARGS(bind_list);
         
         // 2. Prepare the sql statement, use NULL as argv
         ec = IDA_ROAE_eval_command(nc, buff, sizeof(buff), NULL);
@@ -2688,6 +3020,9 @@ static int main_roae(int argc, char *argv[]) {
             fprintf(stderr, "Error evaluating command #%ld\n", nc);
             return -1;
         }
+    }
+    else if (!strcmp(argv[1], "menu")) {
+        roae_menu();
     }
     else {
         help_roae(argc, argv);
@@ -2722,14 +3057,14 @@ static int main_help(int argc, char *argv[])
 
     printf("\n"
            "File system commands:\n"
-           "   basename cat cd chmod close closedir cp dd dir dup dup2 dirname echo\n"
+           "   basename cat cd chmod close closedir cp crc32 dd dir dup dup2 dirname echo\n"
            "   exit(=quit)(=^D) fcd find free fstat ftruncate getenv glob help ls lseek lsof lstat\n"
            "   mkdir mkdirat mkstemp mkdtemp mv open openat opendir prompt pwd\n"
            "   read readlink readlinkat realpath rename renameat rm(=unlink) rmdir seekdir\n"
            "   setenv source spawn stat stty symlink(=ln) symlinkat touch tree truncate\n"
            "   type unlinkat unsetenv write writef\n"
            "Available redirections:\n"
-           "   '> file', '2> file', '>> file', '< file'\n"
+           "   '> file', ' 2> file', ' >> file', ' < file', ' << HEREDOC'\n"
            "IDA commands:\n"
            "   roae siard sqlite unzip\n"
           );
@@ -2755,7 +3090,9 @@ int main(void)
     int argc;
 	char *args[MAX_LINE/2];     /* command line (of 256) has max of 128 arguments */
 	int status = 0;             /* status returned by command */
+
     char *file_in = NULL, *file_out = NULL, *file_out_append= NULL, *file_err = NULL;
+    char *file_in_heredoc = NULL;
 
     // Initialize sqlite shell
     sqlite_shell_init();
@@ -2796,6 +3133,7 @@ int main(void)
             close(stdout_0);
             stdout_0 = -1;
             file_out = NULL;
+            file_out_append = NULL;
         }
         if (file_err && stderr_0 != -1) {
             fclose(stderr);
@@ -2804,6 +3142,14 @@ int main(void)
             close(stderr_0);
             stderr_0 = -1;
             file_err = NULL;
+        }
+        if (file_in_heredoc && stdin_0 != -1) {
+            fclose(stdin);
+            dup2(stdin_0,  STDIN_FILENO);
+            stdin = fdopen(STDIN_FILENO, "r");
+            close(stdin_0);
+            stdin_0 = -1;
+            file_in_heredoc = NULL;
         }
 
         // Only print prompt if we are in a tty and for commands ended by
@@ -2837,7 +3183,18 @@ int main(void)
         // Argument postprocessing
         // ignore_comments(&argc, args);
         replace_status(argc, args, status); // Parse $? symbol
-        parse_redirections(args, &argc, &file_in, &file_out, &file_out_append, &file_err);
+        replace_env(argc, args);            // Parse environment variables (e.g. $ENV) 
+        parse_redirections(args, &argc, &file_in, &file_out, &file_out_append, &file_err, &file_in_heredoc);
+
+        // Avoid loops in redirections, e.g. "cat < a.txt >> a.txt"
+        if ((file_in && file_out && is_same_file(file_in, file_out))
+             || (file_in && file_err && is_same_file(file_in, file_err))
+             || (file_in && file_out_append && is_same_file(file_in, file_out_append))
+           ) {
+            fprintf(stderr, "input file is output file\n");
+            continue;
+        }
+
 
         // Do redirections
         // TODO: check errors in redirection
@@ -2894,6 +3251,21 @@ int main(void)
             }
             else{
                 perror("Error in stderr redirection '2>'");
+                status = -1;
+                continue;
+            }
+        }
+
+        if (file_in_heredoc){
+            int hderror = 0;
+            int tmpfd = heredoc_open(file_in_heredoc);
+            if(tmpfd > 0) {
+                fflush(stdin); // clear buffer before dup
+                stdin_0  = dup(STDIN_FILENO);
+                dup2(tmpfd, STDIN_FILENO);
+                close(tmpfd);
+            } else {
+                fprintf(stderr, "Error in heredoc redirection '<<'\n");
                 status = -1;
                 continue;
             }
@@ -2965,6 +3337,11 @@ int main(void)
 
         if (!strcmp("getenv", args[0])){
             status = main_getenv(argc, args);
+            continue;
+        }
+
+        if (!strcmp("env", args[0])){
+            status = main_env(argc, args);
             continue;
         }
 
@@ -3197,6 +3574,23 @@ int main(void)
             continue;
         }
 
+        if (!strcmp("crc32", args[0])){
+            status = main_crc32(argc, args);
+            continue;
+        }
+
+        extern int main_find(int argc, char** args);
+        if (!strcmp("find", args[0])){
+            status = main_find(argc, args);
+            continue;
+        }
+
+        extern int main_grep(int argc, char** args);
+        if (!strcmp("grep", args[0])){
+            status = main_grep(argc, args);
+            continue;
+        }
+
         if (!strcmp("sqlite", args[0])){
             status = main_sqlite(argc, args);
             continue;
@@ -3214,18 +3608,6 @@ int main(void)
 
         if (!strcmp("unzip", args[0])){
             status = main_unzip(argc, args);
-            continue;
-        }
-
-        extern int main_grep(int argc, char** args);
-        if (!strcmp("grep", args[0])){
-            status = main_grep(argc, args);
-            continue;
-        }
-
-        extern int main_find(int argc, char** args);
-        if (!strcmp("find", args[0])){
-            status = main_find(argc, args);
             continue;
         }
 

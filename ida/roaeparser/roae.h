@@ -35,6 +35,13 @@ void IDA_ROAE_print_commands();
 void IDA_ROAE_print_command(long nc);
 void IDA_ROAE_search(char *re);
 long IDA_ROAE_count();
+char** IDA_ROAE_command_bind_list(long nc, char *values[]);
+char* IDA_ROAE_command_bind_list_to_sqlite(char *bind_list[]);
 char* IDA_ROAE_eval_command(long nc, char *buff, long buffsize, char *values[]);
+char* IDA_ROAE_get_command_title(long nc);
+int IDA_ROAE_command_title_match(long nc, char* r);
+long IDA_ROAE_get_command_nargs(long nc);
+char* IDA_ROAE_get_command_arg_name(long nc, long na);
+char* IDA_ROAE_get_command_arg_comment(long nc, long na);
 
 #endif /* ! __IDA_ROAE_H__ */

@@ -35,8 +35,18 @@ You can interact with the sqlite3 shell by launching SQL statements or sqlite sh
   // Init sqlite shell
   void IDA_SQLITE_shell_init();
   
+  // Run an internal sqlite command, that is, those that start with "."
+  int IDA_SQLITE_do_meta_command(char *cmd);
+  
+  // Run an SQL command
+  int IDA_SQLITE_shell_exec(char *cmd);
+  
   // Run an internal command or SQL command depending on whether it starts with "."
   int IDA_SQLITE_run(char *cmd);
+  
+  // Run an sequence of internal or SQL commands separated by newline ("\n") 
+  int IDA_SQLITE_run_sequence(char *cmd);
+  
 ```
 
 ## References 

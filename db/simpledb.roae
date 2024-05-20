@@ -116,6 +116,13 @@ Command:#--- bad - 3
 
 # Good ones again:
 #---5
+Command:
+    title = "Get all entries of a table [working only with method 'replace']"
+    Parameters:
+        tablename - name of a table in DB (e.g. users or favourites), without quotes 
+    Body:
+        SELECT * from $${tablename} 
+#---6
 
 Command:
     title = "Get the favourites of a given userid"
@@ -127,7 +134,7 @@ Command:
         WHERE users.id == favourites.userid
               AND users.id == $${userid};
 
-#---6
+#---7
 Command:
     title = "Get the users whith a favourite matching the first parameter"
     Parameters:

@@ -29,7 +29,7 @@
 #include <glob.h>
 #include <stdint.h>
 
-#define ROAESHELL_VERSION "v0.1.9 (2024050200)"
+#define ROAESHELL_VERSION "v0.1.10 (2024052000)"
 
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -2853,22 +2853,30 @@ static void roae_menu()
         printf("\nAvailable ROAE cases:\n");
         for (long i=0; i<ncommands; i++){
             char *c = IDA_ROAE_get_command_title(i);
-            printf(" [%02ld] %s\n", i, c);
+            printf(" [%ld] %s\n", i, c);
             free(c);
         };
-        printf(" [%02ld] QUIT\n", ncommands); // #ncommands is to quit the selection loop
+        printf(" [Q] QUIT\n"); // #last entry to quit the selection loop
 
         // Select a ROAE command
-        nc=0; scnf=0;
+        nc=-1; scnf=0;
         printf("Select ROAE command number: ");
         char *roae = fgets(menubuff, ROAEBUFFSIZE-1, stdin); menubuff[ROAEBUFFSIZE-1]='\0';
-        if (roae) scnf = sscanf(roae, "%ld", &nc);
-        if (scnf>0 && nc>=0 && nc<=ncommands){
-            if (nc == ncommands) {
-                // Quit from the selection loop
-                printf(" QUIT selected ... quitting ...\n\n");
+        if (roae){
+            scnf = sscanf(roae, "%ld", &nc);
+            if ('\n' == roae[0]){
+                 continue; // Typed enter, do nothing, restart the menu
+            }
+            if ('Q' == roae[0] || 'q' == roae[0]){
+                printf(" QUIT selected ... quitting selection menu ... you can restart it with 'roae menu'\n\n");
                 break;
             }
+        } else { // fgets EOF
+            fprintf(stderr, "\nBroken stdin\n");
+            clearerr(stdin);
+            break; // Quit on ^D 
+        } 
+        if (scnf>0 && nc>=0 && nc<ncommands){
             printf("  selected ROAE command no. %ld\n", nc);
             char *c = IDA_ROAE_get_command_title(nc);
             printf("  title=%s\n", c);
@@ -2941,8 +2949,8 @@ static void roae_menu()
             if (arglist) FREEARGS(arglist);
             
         } else {
-            fprintf(stderr, "ROAE command number is not a valid integer (0 <= n < %ld)\n", ncommands);
-            break;
+            fprintf(stderr, "\nROAE command number is not a valid integer ([0, %ld])\n", ncommands-1);
+            continue; // Restart menu if not valid number
         }
     }
 }

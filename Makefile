@@ -50,7 +50,7 @@ THIRDPARTYTINYXML2DIR=$(THIRDPARTYDIR)/tinyxml2
 # IDA libraries included in this project
 IDAROAEPARSERDIR=./ida/roaeparser
 IDASIARD2SQLDIR=./ida/siard2sql
-
+IDASIARD2SQLITEDIR=./ida/siard2sqlite
 # All this directory is included in the IVM filesystem
 DATADIR=db
 
@@ -107,9 +107,8 @@ $(LIBDIR)/libsiard2sql.a:
 	@cp -v `find $(IDASIARD2SQLDIR) -name libsiard2sql.a` "$@"
 
 $(LIBDIR)/libsiard2sqlite.a:
-	echo "\n copying my lib \n"
-	@echo "Starting build in directory: $(shell pwd)"
-	cp libsiard2sqlite.a $(LIBDIR)/libsiard2sqlite.a
+	cd $(IDASIARD2SQLITEDIR) && ./build.sh -lib
+	cp $(IDASIARD2SQLITEDIR)/build/libsiard2sqlite.a $(LIBDIR)/libsiard2sqlite.a
 
 #$(LIBDIR)/%.a: $(IDAEXTSIARD2SQLDIR)/$(LIBDIR)/%.a
 #	@mkdir -p $(LIBDIR) || exit -1

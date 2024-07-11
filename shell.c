@@ -2618,6 +2618,29 @@ int main_siard(int argc, char *argv[]) {
     return 0;
 }
 
+extern int siard2db(const char * filePath);
+extern int siard2sql(const char* filePath);
+static void help_siard2sqlite(int argc, char *argv[]) {
+    printf("Usage: %s <path to siardarchive> \n",argv[0]);
+    printf("Usage: %s <path to siardarchive> -sql (to output a sql file instead)\n",argv[0]);
+ }
+int main_siard_tosqlite(int argc, char *argv[]) {
+    if (argc == 3) {
+        if(strcmp(argv[2], "-sql") == 0) {
+        siard2sql(argv[1]);
+        return 0;
+        } else {
+            help_siard2sqlite(argc, argv);
+            return -1;
+        }
+    }
+    if (argc > 3) {
+        help_siard2sqlite(argc, argv);
+        return -1;
+    }
+    return siard2db(argv[1]);
+}
+
 extern int IDA_unzip(const char *zipfile, const char *onefile);
 int main_unzip(int argc, char *argv[]) {
     if (argc < 2) {
@@ -3066,7 +3089,7 @@ static int main_help(int argc, char *argv[])
            "Available redirections:\n"
            "   '> file', ' 2> file', ' >> file', ' < file', ' << HEREDOC'\n"
            "IDA commands:\n"
-           "   roae siard sqlite unzip\n"
+           "   roae siard siard2sqlite sqlite unzip\n"
           );
     return 0;
 }
@@ -3603,6 +3626,12 @@ int main(void)
 
         if (!strcmp("siard", args[0])){
             status = main_siard(argc, args);
+            continue;
+        }
+
+        if (!strcmp("siard2sqlite", args[0])){
+            fprintf(stderr, "SIARD2sqlite");
+            status = main_siard_tosqlite(argc, args);
             continue;
         }
 

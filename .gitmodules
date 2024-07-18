@@ -1,0 +1,3 @@
+[submodule "ida/siard2sqlite"]
+	path = ida/siard2sqlite
+	url = git@github.com:immortalvm/siard2sqlite.git

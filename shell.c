@@ -29,7 +29,7 @@
 #include <glob.h>
 #include <stdint.h>
 
-#define ROAESHELL_VERSION "v0.1.10 (2024052000)"
+#define ROAESHELL_VERSION "v0.1.11 (2024080100)"
 
 #include <termios.h>
 #include <sys/ioctl.h>

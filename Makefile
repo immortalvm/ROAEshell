@@ -50,12 +50,12 @@ THIRDPARTYTINYXML2DIR=$(THIRDPARTYDIR)/tinyxml2
 # IDA libraries included in this project
 IDAROAEPARSERDIR=./ida/roaeparser
 IDASIARD2SQLDIR=./ida/siard2sql
-
+IDASIARD2SQLITEDIR=./ida/siard2sqlite
 # All this directory is included in the IVM filesystem
 DATADIR=db
 
 # IDA project static libraries
-ALIBS=$(LIBDIR)/libroae.a $(LIBDIR)/libsiard2sql.a  $(LIBDIR)/libminizip.a $(LIBDIR)/libz.a $(LIBDIR)/libtinyxml2.a $(LIBDIR)/libsqlite3.a
+ALIBS=$(LIBDIR)/libroae.a $(LIBDIR)/libsiard2sql.a $(LIBDIR)/libsiard2sqlite.a  $(LIBDIR)/libminizip.a $(LIBDIR)/libz.a $(LIBDIR)/libtinyxml2.a $(LIBDIR)/libsqlite3.a
 
 # Sources required by the shell (used by internal commands  ...)
 REQSRC= $(THIRDPARTYDIR)/utils/libfind.c $(THIRDPARTYDIR)/utils/libgrep.c $(THIRDPARTYDIR)/utils/regexp.c
@@ -63,7 +63,7 @@ REQSRC= $(THIRDPARTYDIR)/utils/libfind.c $(THIRDPARTYDIR)/utils/libgrep.c $(THIR
 .PHONY: roaeshell binaries clean
 
 roaeshell: $(ALIBS) $(BUILDDIR)/ivmfs.c libspawn.c $(REQSRC) shell.c
-	$(CC) $(CFLAGS) -o $(BUILDDIR)/$@  libspawn.c $(BUILDDIR)/ivmfs.c $(REQSRC) shell.c $(INC) -L $(LIBDIR) -lsiard2sql -lroae -lsqlite3 -lstdc++ -lminizip -lz -ltinyxml2 -lm
+	$(CC) $(CFLAGS) -o $(BUILDDIR)/$@  libspawn.c $(BUILDDIR)/ivmfs.c $(REQSRC) shell.c $(INC) -L $(LIBDIR) -lsiard2sqlite -lsiard2sql -lroae -lsqlite3 -lstdc++ -lminizip -lz -ltinyxml2 -lm
 	cp -r "$(DATADIR)" $(BUILDDIR)/
 	mkdir -p  $(BUILDDIR)/bin/ ; mv -f bin/* $(BUILDDIR)/bin/ ; rmdir -v bin
 	@echo; echo; test -f "$(BUILDDIR)/$@"  && echo "Run as: (cd $(BUILDDIR); ./$@)"
@@ -106,6 +106,10 @@ $(LIBDIR)/libsiard2sql.a:
 	@mkdir -p $(LIBDIR)   || exit -1
 	@cp -v `find $(IDASIARD2SQLDIR) -name libsiard2sql.a` "$@"
 
+$(LIBDIR)/libsiard2sqlite.a:
+	cd $(IDASIARD2SQLITEDIR) && ./build.sh -lib
+	cp $(IDASIARD2SQLITEDIR)/build/libsiard2sqlite.a $(LIBDIR)/libsiard2sqlite.a
+
 #$(LIBDIR)/%.a: $(IDAEXTSIARD2SQLDIR)/$(LIBDIR)/%.a
 #	@mkdir -p $(LIBDIR) || exit -1
 #	@cp -v "$^" "$@"
@@ -120,7 +124,7 @@ binaries: roaeshell.b find.b grep.b
 
 roaeshell.b: $(ALIBS) $(BUILDDIR)/ivmfs-empty.c libspawn.c $(REQSRC) shell.c
 	@mkdir -p bin || exit -1
-	$(CC) $(CFLAGS) -o bin/$@.ivm  libspawn.c $(BUILDDIR)/ivmfs-empty.c $(REQSRC) shell.c $(INC) -L $(LIBDIR) -lsiard2sql -lroae -lsqlite3 -lstdc++ -lminizip -lz -ltinyxml2 -lm
+	$(CC) $(CFLAGS) -o bin/$@.ivm  libspawn.c $(BUILDDIR)/ivmfs-empty.c $(REQSRC) shell.c $(INC) -L $(LIBDIR) -lsiard2sqlite -lsiard2sql -lroae -lsqlite3 -lstdc++ -lminizip -lz -ltinyxml2 -lm
 	if test "$(CC)" = "ivm64-gcc" ; then \
        $(IVM_AS) bin/$@.ivm --bin bin/$@ --sym /dev/null; rm -f bin/$@.ivm; chmod +rx "bin/$@"; \
     else \

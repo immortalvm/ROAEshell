@@ -13,6 +13,9 @@ Type ```build.sh``` for help:
 
 If used flag ```-c```, a cleaning is made prior to building.
 
+P.S siard2sqlite is added as a git submodule, therefore you need to run :
+```git submodule update --init --recursive```
+at least once to download all of the dependencies.
 ## Cross compiling for ivm64
 
 When cross-compiling for the ivm64 architecture you need to

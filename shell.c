@@ -5,51 +5,39 @@
     A shell to interface with the Read-Only Access Engine (ROAE)
 
     Authors:
-    Eladio Gutierrez, Sergio Romero, Oscar Plata
+    Sergio Romero, Eladio Gutierrez, Oscar Plata
     University of Malaga, Spain
-
+  
     Aug, 2023
 */
 
-#include <limits.h>
-#include <errno.h>
+#define ROAESHELL_VERSION "v1.0 (2024112900)"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <ctype.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dirent.h>
 #include <libgen.h>
-#include <sys/stat.h>
-#include <ctype.h>
+#include <limits.h>
+#include <dirent.h>
+#include <errno.h>
 #include <glob.h>
-#include <stdint.h>
-
-#define ROAESHELL_VERSION "v0.1.11 (2024080100)"
-
 #include <termios.h>
 #include <sys/ioctl.h>
 
-#ifdef __ivm64__
-extern int ivm_spawn(int argc, char *argv[]);
-#else
-#include <spawn.h>
-#endif
+#define MAX_LINE 4096
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
+// Some extra flags. See newlib/libc/include/sys/_default_fcntl.h
+#ifndef O_PATH
+#define O_PATH  0x2000000
 #endif
-
-// See newlib/libc/include/sys/_default_fcntl.h
-#ifndef AT_EMPTY_PATH
-#define AT_EMPTY_PATH          16
-#endif
-
-// Linux specific flag
 #ifndef O_TMPFILE
     #ifdef __ivm64__
     // See newlib/libc/include/sys/_default_fcntl.h
@@ -62,344 +50,838 @@ extern int ivm_spawn(int argc, char *argv[]);
     #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
     #endif
 #endif
-
-#ifdef __ivm64__
-#define getline __getline
-#define getdelim __getdelim
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 16
 #endif
-
-#define MAX_LINE 4*4096 /* chars per line, per command, should be enough. */
-
-#undef BUFSIZ
-#define BUFSIZ PATH_MAX
 
 // MAX/MIN only one evaluation
 #define MIN(a,b) ({__typeof__(a) _a=(a); __typeof__(b) _b=(b); (_a < _b)?_a:_b;})
 #define MAX(a,b) ({__typeof__(a) _a=(a); __typeof__(b) _b=(b); (_a > _b)?_a:_b;})
+#define SWAP(a,b) ({__typeof__(a) tmp=a; a=b; b=tmp; })
 
-// Some prototypes
-static int get_prompt();
-static void set_prompt(int);
+// flags for redirections
+#define R_NO_REDIR 0x00
+#define R_FILE_IN  0x04
+#define R_FILE_OUT 0x05
+#define R_FILE_ERR 0x06
+#define R_RAWINPUT 0x07
+#define R_APPEND   0x08
+#define R_EOFINPUT 0x10
+#define R_FUNC_ARG 0x20
+#define REDIR_MASK 0x03
+#define REDIR_BIT  0x04
 
-// Some external functions
-extern char *get_current_dir_name(void);
 
-// Some global variables related with each running command
-static int stdin_0 = -1, stdout_0 = -1, stderr_0 = -1;
-static int prompt = 2;
+////////////////////////////////////////////////////////////////////////////////
+// Prototypes
+////////////////////////////////////////////////////////////////////////////////
+static int main_argv(int argc, char *argv[]);
+static int main_bn(int argc, char *argv[]);
+static int main_cat(int argc, char *argv[]);
+static int main_cd(int argc, char *argv[]);
+static int main_chmod(int argc, char *argv[]);
+static int main_close(int argc, char *argv[]);
+static int main_cmp(int argc, char *argv[]);
+static int main_cp(int argc, char *argv[]);
+static int main_crc32(int argc, char *argv[]);
+static int main_dd(int argc, char *argv[]);
+static int main_dir(int argc, char *argv[]);
+static int main_dn(int argc, char *argv[]);
+static int main_du(int argc, char *argv[]);
+static int main_dup(int argc, char *argv[]);
+static int main_dup2(int argc, char *argv[]);
+static int main_echo(int argc, char *argv[]);
+static int main_env(int argc, char *argv[]);
+static int main_export(int argc, char *argv[]);
+static int main_fchmod(int argc, char *argv[]);
+static int main_fchmodat(int argc, char *argv[]);
+static int main_fcmp(int argc, char *argv[]);
+static int main_ftruncate(int argc, char *argv[]);
+static int main_glob(int argc, char *argv[]);
+static int main_help(int argc, char *argv[]);
+static int main_hexdump(int argc, char *argv[]);
+static int main_ioctl(int argc, char *argv[]);
+static int main_linkat(int argc, char *argv[]);
+static int main_ln(int argc, char *argv[]);
+static int main_ls(int argc, char *argv[]);
+static int main_lsreel(int argc, char *argv[]);
+static int main_lseek(int argc, char *argv[]);
+static int main_lsof(int argc, char *argv[]);
+static int main_meminfo(int argc, char *argv[]);
+static int main_mkdir(int argc, char *argv[]);
+static int main_mv(int argc, char *argv[]);
+static int main_open(int argc, char *argv[]);
+static int main_openat(int argc, char *argv[]);
+static int main_pwd(int argc, char *argv[]);
+static int main_read(int argc, char *argv[]);
+static int main_readlink(int argc, char *argv[]);
+static int main_realpath(int argc, char *argv[]);
+static int main_rename(int argc, char *argv[]);
+static int main_renameat(int argc, char *argv[]);
+static int main_rm(int argc, char *argv[]);
+static int main_rmdir(int argc, char *argv[]);
+static int main_seekdir(int argc, char *argv[]);
+static int main_set(int argc, char *argv[]);
+static int main_stat(int argc, char *argv[]);
+static int main_stty(int argc, char *argv[]);
+static int main_tee(int argc, char *argv[]);
+static int main_touch(int argc, char *argv[]);
+static int main_tree(int argc, char *argv[]);
+static int main_truncate(int argc, char *argv[]);
+static int main_type(int argc, char *argv[]);
+static int main_unset(int argc, char *argv[]);
+static int main_umask(int argc, char *argv[]);
+static int main_wc(int argc, char *argv[]);
+static int main_write(int argc, char *argv[]);
+static int writechars(int argc, char *argv[]);
 
-// -----------------------------------------------------------------------
-// Parse redirections operators '<' '>' once args structure has been built.
-// Include this file and call the function immediately after get_command():
-//
-//     #include "parse_redir.h"
-//     ...
-//     while(...){
-//          // Shell main loop
-//          ...
-//          get_command(...);
-//          char *file_in, *file_out;
-//          parse_redirections(args, &argc, &file_in, &file_out_append, &file_out, &file_err);
-//          ...
-//     }
-//
-// For a valid redirection, a blank space is required before and after
-// redirection operators '<' or '>'.
-// --------------------------------------------------------------
-static void parse_redirections(char **args,  int *argc, char **file_in, char **file_out, char **file_out_append, char **file_err, char **file_in_heredoc){
-    *file_in = NULL;
-    *file_out = NULL;
-    *file_out_append = NULL;
-    *file_err = NULL;
-    *file_in_heredoc = NULL;
-    char **args_start = args;
-    while (*args) {
-        int is_in = !strcmp(*args, "<");
-        int is_out = !strcmp(*args, ">");
-        int is_out_append = !strcmp(*args, ">>");
-        int is_err = !strcmp(*args, "2>");
-        int is_in_heredoc = !strcmp(*args, "<<");
-        if (is_in || is_out || is_err || is_out_append || is_in_heredoc) {
-            args++;
-            if (*args){
-                (*argc) -= 2;
-                if (is_in)  {*file_in = *args; *file_in_heredoc = NULL;}
-                if (is_out) {*file_out = *args; *file_out_append = NULL;}
-                if (is_out_append) {*file_out = NULL; *file_out_append = *args;}
-                if (is_err) *file_err = *args;
-                if (is_in_heredoc) {*file_in = NULL; *file_in_heredoc = *args;}
-                char **aux = args + 1;
-                while (*aux) {
-                   *(aux-2) = *aux;
-                   aux++;
-                }
-                *(aux-2) = NULL;
-                args--;
-            } else {
-                /* Syntax error */
-                fprintf(stderr, "syntax error in redirection\n");
-                args_start[0] = NULL; // Do nothing
-            }
-        } else {
-            args++;
-        }
+static int main_spawn(int argc, char *argv[]);
+static int main_source(int argc, char *argv[]);
+
+// roae shell commands
+static int main_roae(int argc, char *argv[]);
+static int main_siard(int argc, char *argv[]);
+static int main_sqlite(int argc, char *argv[]);
+static int main_unzip(int argc, char *argv[]);
+// end roae shell cmds
+
+extern int main_find(int argc, char *argv[]);
+extern int main_grep(int argc, char *argv[]);
+
+#ifdef __ivm64__
+extern int ivm_spawn(int argc, char *argv[]);
+#endif
+
+static void sqlite_shell_init();
+// End of prototypes (extern or placed at the end of the current file
+////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// shell types, variables and supporting functions
+////////////////////////////////////////////////////////////////////////////////
+
+char cwd[PATH_MAX];	// current working directory
+
+typedef enum {
+    COND_QUIT   = -1,
+    COND_ENDL   = 0,
+    COND_SEQ,
+    COND_BACK,
+    COND_OR,
+    COND_AND,
+    COND_PIPE,
+} cond_t;
+
+// Arguments
+typedef struct argument {
+    int argc;
+    char **argv;
+} argument_t;
+
+// input argument is a struct (not a pointer)
+// result is a struct (not a pointer)
+static argument_t argument_copy(argument_t arg)
+{
+    int argc  = arg.argc;
+    char **argv = (char **)malloc((argc + 1) * sizeof(char *));
+    for (int i = 0; i < argc; i++) {
+        argv[i] = strdup(arg.argv[i]);
     }
+    argv[argc] = NULL;
+    return (argument_t) { argc:argc, argv:argv };
+}
+// End of arguments
+
+
+// Redirection
+typedef struct {
+    char* value;
+    int   type;
+} redir_t;
+// input argument is a struct (not a pointer)
+// result is a struct (not a pointer)
+static redir_t redir_copy(redir_t orig)
+{
+    return (redir_t) { value:strdup(orig.value), type:orig.type };
+}
+// End of redirection
+
+
+// Redirection vector
+typedef struct {
+    int count;
+    redir_t* redir;
+} redir_vect_t;
+// input argument is a struct (not a pointer)
+// result is a struct (not a pointer)
+static redir_vect_t redir_vect_copy(redir_vect_t orig)
+{
+    int count = orig.count;
+    if (!count) return (redir_vect_t) { 0, NULL };
+    redir_t *vect = (redir_t*)malloc(count * sizeof(redir_t));
+    for (int i = 0; i < count; i++) {
+        vect[i] = redir_copy(orig.redir[i]);
+    }
+    return (redir_vect_t) { count:count, redir:vect };
+}
+// End of redirection vector
+
+// Split command
+typedef struct {
+    argument_t arg;
+    redir_vect_t in;
+    redir_vect_t out;
+    redir_vect_t err;
+} split_cmd_t;
+
+static void split_cmd_clear(split_cmd_t *split_cmd)
+{
+    if (split_cmd->arg.argv) {
+        int argc = split_cmd->arg.argc;
+        for (int i = 0; i < argc; i++) free(split_cmd->arg.argv[i]);
+        free(split_cmd->arg.argv);
+    }
+    free(split_cmd->in.redir);
+    free(split_cmd->out.redir);
+    free(split_cmd->err.redir);
+    split_cmd->arg = (argument_t){ 0, NULL };
+    split_cmd->in  = (redir_vect_t){ count:0, redir:NULL };
+    split_cmd->out = (redir_vect_t){ count:0, redir:NULL };
+    split_cmd->err = (redir_vect_t){ count:0, redir:NULL };
 }
 
-static int is_same_inode(int fd1, int fd2)
+static void split_cmd_print_short(split_cmd_t *split_cmd, cond_t cond)
 {
-    struct stat s1, s2;
-    int e1, e2;
-    e1 = fstat(fd1, &s1);
-    e2 = fstat(fd2, &s2);
-    if (!e1 && !e2){
-        if (s1.st_ino == s2.st_ino) {
-            return 1;
-        }
+    FILE *stream = stdout;
+    fputs(((split_cmd->arg.argc == 0) &&
+            ((split_cmd->in.count > 0)||
+            (split_cmd->out.count > 0)||
+            (split_cmd->err.count > 0)))? "[cat] ": "", stream);
+    for (int i = 0; i < split_cmd->arg.argc; i++) {
+        fprintf(stream, "%s ", split_cmd->arg.argv[i]);
     }
-    return 0;
+
+    for (int i = 0; i < split_cmd->in.count; i++) {
+        fprintf(stream, "%s %s ", (split_cmd->in.redir[i].type == R_FILE_IN)? "<": "<<<",
+                split_cmd->in.redir[i].value);
+    }
+    for (int i = 0; i < split_cmd->out.count; i++) {
+        fprintf(stream, "%s %s ", (split_cmd->out.redir[i].type & R_APPEND)? ">>": ">",
+                split_cmd->out.redir[i].value);
+    }
+    for (int i = 0; i < split_cmd->err.count; i++) {
+        fprintf(stream, "2%s %s ", (split_cmd->err.redir[i].type & R_APPEND)? ">>": ">",
+                split_cmd->err.redir[i].value);
+    }
+
+    switch (cond) {
+        case COND_ENDL: fprintf(stream, "\n");   break;
+        case COND_PIPE: fprintf(stream, "| ");   break;
+        case COND_SEQ:  fprintf(stream, "; ");   break;
+        case COND_AND:  fprintf(stream, "&& ");  break;
+        case COND_OR:   fprintf(stream, "|| ");  break;
+        case COND_BACK: fprintf(stream, "& ");   break;
+        default: break;
+    }
+    fflush(stream);
 }
 
-static int is_same_file(const char *f1, const char *f2)
+static void split_cmd_print_verbose(split_cmd_t *split_cmd, cond_t cond)
 {
-    struct stat s1, s2;
-    int e1, e2;
-    e1 = stat(f1, &s1);
-    e2 = stat(f2, &s2);
-    if (!e1 && !e2){
-        if (s1.st_ino == s2.st_ino) {
-            return 1;
+    FILE *stream = stderr;
+    fputs("Command: ", stream);
+    fputs((split_cmd->arg.argc == 0)? "[cat] ": " ", stream);
+    for (int i = 0; i < split_cmd->arg.argc; i++) {
+        fprintf(stream, "%s ", split_cmd->arg.argv[i]);
+    }
+    int count = split_cmd->in.count;
+    if (count) {
+        fprintf(stream, "\nInput redirections (%d): ", count);
+        for (int i = 0; i < count; i++) {
+            fprintf(stream, "%s %s ", (split_cmd->in.redir[i].type == R_FILE_IN)? "<": "<<<",
+                    split_cmd->in.redir[i].value);
         }
     }
-    return 0;
+    count = split_cmd->out.count;
+    if (count) {
+        fprintf(stream, "\nOutput redirections (%d): ", count);
+        for (int i = 0; i < count; i++) {
+            fprintf(stream, "%s %s ", (split_cmd->out.redir[i].type & R_APPEND)? ">>": ">",
+                    split_cmd->out.redir[i].value);
+        }
+    }
+    count = split_cmd->err.count;
+    if (count) {
+        fprintf(stream, "\nErrors redirections: ");    
+        for (int i = 0; i < count; i++) {
+            fprintf(stream, "%s %s ", (split_cmd->err.redir[i].type & R_APPEND)? ">>": ">",
+                    split_cmd->err.redir[i].value);
+        }
+    }
+    fputs("\nEnd with: ", stream);
+    switch (cond) {
+        case COND_ENDL: fprintf(stream, "'\\n'");   break;
+        case COND_PIPE: fprintf(stream, "| ");   break;
+        case COND_SEQ:  fprintf(stream, "; ");   break;
+        case COND_AND:  fprintf(stream, "&& ");  break;
+        case COND_OR:   fprintf(stream, "|| ");  break;
+        case COND_BACK: fprintf(stream, "& ");   break;
+        default: break;
+    }   
+    fprintf(stream, "\n--\n");
+    fflush(stream);
 }
+// End of split_cmd
 
 
-// -----------------------------------------------------------------------
-//  get_command() reads in the next command line, separating it into distinct tokens
-//  using whitespace as delimiters.
-//  Separators ';' and '&' allows having several subcommands in the same line; a
-//  subcommand is returned in each invocation of get_command()
-//  Reference: Operating System Concepts by A. Silberschatz et al.
-// -----------------------------------------------------------------------
-int get_command(char inputBuffer_i[], int size, char *args[], char *separator)
+// Command
+typedef struct command {
+    split_cmd_t readed;
+    split_cmd_t parsed;
+    int count_redir[3];
+    cond_t cond;
+    int pipe;
+    struct command* next;
+} command_t;
+
+static command_t* new_command()
 {
-	int length, /* # of characters in the command line */
-		i,      /* loop index for accessing inputBuffer array */
-		start,  /* index where beginning of next command parameter is */
-		ct;     /* index of where to place the next parameter into args[] */
+    command_t *cmd = (command_t*)malloc(sizeof(command_t));
+    if (!cmd) return NULL;
+    // chain in cmd_line
+    cmd->cond = COND_ENDL;
+    cmd->next = NULL;
+    // read arena
+    cmd->readed.arg = (argument_t) { 0, NULL };
+    cmd->readed.in  = (redir_vect_t) { 0, NULL };
+    cmd->readed.out = (redir_vect_t) { 0, NULL };
+    cmd->readed.err = (redir_vect_t) { 0, NULL };
+    // parse arena
+    // prevent access in show_command, and avoid problems with clean_command
+    cmd->parsed.arg = (argument_t){ 0, NULL };
+    cmd->parsed.in  = (redir_vect_t) { 0, NULL };
+    cmd->parsed.out = (redir_vect_t) { 0, NULL };
+    cmd->parsed.err = (redir_vect_t) { 0, NULL };
+    // execution
+    cmd->count_redir[0] = 0;
+    cmd->count_redir[1] = 0;
+    cmd->count_redir[2] = 0;
+    cmd->pipe = -1;
 
-	ct = 0;
-    *separator = 0;
+    return cmd;
+}
+// copy a clean command, only read arena
+static command_t* new_command_copy(command_t *cmd)
+{
+    if (!cmd) return NULL;
+    command_t *new = new_command();
+    if (!new) return NULL;
+    // chain in cmd_line
+    new->cond = cmd->cond;
+    // read arena
+    new->readed.arg = argument_copy(cmd->readed.arg);
+    new->readed.in  = redir_vect_copy(cmd->readed.in);
+    new->readed.out = redir_vect_copy(cmd->readed.out);
+    new->readed.err = redir_vect_copy(cmd->readed.err);
+    return new;
+}
+// clear or delete command (depends on keep arg)
+static void command_clear(command_t *cmd, int keep)
+{
+    // free arguments allocated by parse_command (during exec_line())
+    split_cmd_clear(&cmd->parsed);
 
-	/* read what the user enters on the command line */
-	//length = read(STDIN_FILENO, inputBuffer, size);
-
-    char *inputBuffer = inputBuffer_i;
-
-    // In case several subcommands in the same line, this pointer points to the
-    // next subcommand to be processed
-    static char* inputBuffer_next = NULL;
-
-    if (inputBuffer_next && *inputBuffer_next) {
-        // There is left subcommands to be processed of the last line that was
-        // read
-        inputBuffer = inputBuffer_next;
-        length = strlen(inputBuffer)+1;
+    if (keep) {
+        // clear fields used during execution if cmd is kept
+        cmd->count_redir[0] = 0;
+        cmd->count_redir[1] = 0;
+        cmd->count_redir[2] = 0;
+        cmd->pipe = -1;
     } else {
-        // No pending subcommands: read a new line entered by the user on the
-        // command line
-        if (0 && isatty(STDIN_FILENO)) {
-	        length = read(STDIN_FILENO, inputBuffer, size);
+        // free reusable data (allocated by get_line())
+        split_cmd_clear(&cmd->readed);
+        free(cmd);
+    }
+}
+// transfer (readed) input redirections from cmd_o to cmd_d
+// chain info not set: next, cond
+static command_t* command_merge_input(command_t *cmd_d, command_t *cmd_o)
+{
+    if (!cmd_d) return NULL;
+    if (!cmd_o) return cmd_d;
+    split_cmd_t *scmd_o = &cmd_o->readed;
+    split_cmd_t *scmd_d = &cmd_d->readed;
+    int extra = scmd_o->in.count;
+    if (extra) {
+        int init = scmd_d->in.count;
+        int count = init + extra;
+        redir_t *tmp = realloc(scmd_d->in.redir, count * sizeof(redir_t *));
+        if (tmp) {
+            scmd_d->in.count = count;
+            for (int i = 0; i < extra; i++) {
+                tmp[init + i] = scmd_o->in.redir[i]; // transfer, not copy
+            }
+            scmd_d->in.redir = tmp;
+            free(scmd_o->in.redir);
+            scmd_o->in.redir = NULL;
+            scmd_o->in.count = 0;
+        }
+    }
+    return cmd_d;
+}
+// transfer (readed) output/error redirections from cmd_o to cmd_d
+// chain info not set: next, cond
+static command_t* command_merge_output(command_t *cmd_d, command_t *cmd_o)
+{
+    if (!cmd_d) return NULL;
+    if (!cmd_o) return cmd_d;
+    split_cmd_t *scmd_o = &cmd_o->readed;
+    split_cmd_t *scmd_d = &cmd_d->readed;
+
+    int extra = scmd_o->out.count;
+    if (extra) {
+        int init = scmd_d->out.count;
+        int count = init + extra;
+        redir_t *tmp = realloc(scmd_d->out.redir, count * sizeof(redir_t *));
+        if (tmp) {
+            scmd_d->out.count = count;
+            for (int i = 0; i < extra; i++) {
+                tmp[init + i] = scmd_o->out.redir[i]; // transfer, not copy
+            }
+            scmd_d->out.redir = tmp;
+            free(scmd_o->out.redir);
+            scmd_o->out.redir = NULL;
+            scmd_o->out.count = 0;
+        }
+    }
+    extra = scmd_o->err.count;
+    if (extra) {
+        int init = scmd_d->err.count;
+        int count = init + extra;
+        redir_t *tmp = realloc(scmd_d->err.redir, count * sizeof(redir_t *));
+        if (tmp) {
+            scmd_d->err.count = count;
+            for (int i = 0; i < extra; i++) {
+                tmp[init + i] = scmd_o->err.redir[i]; // transfer, not copy
+            }
+            scmd_d->err.redir = tmp;
+            free(scmd_o->err.redir);
+            scmd_o->err.redir = NULL;
+            scmd_o->err.count = 0;
+        }
+    }
+    return cmd_d;
+}
+
+// print readed command
+static void command_print_short(command_t *cmd)
+{
+    split_cmd_print_short(&cmd->readed, cmd->cond);
+}
+// print parsed command
+static void command_print_verbose(command_t *cmd)
+{
+    split_cmd_print_verbose(&cmd->parsed, cmd->cond);
+}
+// End of command
+
+
+// Command line
+typedef struct cmdline_st{
+    int index;
+    command_t *first_cmd;
+    struct cmdline_st *next_line;
+} cmdline_t;
+// New command line, includes the given command, NOT A COPY!
+static cmdline_t* new_cmdline(command_t *first_cmd)
+{
+    cmdline_t *newcmdline = (cmdline_t*)malloc(sizeof(cmdline_t));
+    if (!newcmdline) return NULL;
+    newcmdline->index = 0;
+    newcmdline->first_cmd = first_cmd;
+    newcmdline->next_line = NULL;
+    return newcmdline;
+}
+// Copy a command line, copying each command
+static cmdline_t* new_cmdline_copy(cmdline_t *cmdline)
+{
+    if (!cmdline || !cmdline->first_cmd) return NULL;
+    command_t *cmd_o = cmdline->first_cmd;
+    command_t *cmd_d = new_command_copy(cmd_o);
+
+    cmdline_t *newline = new_cmdline(cmd_d);
+    if (!newline) return NULL;
+    while (cmd_o && cmd_o->cond != COND_ENDL) {
+        cmd_o = cmd_o->next;
+        cmd_d = cmd_d->next = new_command_copy(cmd_o);
+    }
+    cmd_d->next = NULL;
+    return newline;
+}
+// print command line
+static void cmdline_print(cmdline_t *cmdline)
+{
+    if (!cmdline) return;
+    command_t *cmd = cmdline->first_cmd;
+    while (cmd) {
+        command_print_short(cmd);
+        cmd = cmd->next;
+    }
+}
+// print command line sequence
+static void cmdline_seq_print(cmdline_t *cmdline)
+{
+    if (!cmdline) return;
+    if (cmdline->next_line) cmdline_seq_print(cmdline->next_line);
+    printf("[%d] ", cmdline->index);
+    cmdline_print(cmdline);
+}
+// clear or delete a command line (depends on arg keep)
+static void cmdline_clear(cmdline_t *cmdline, int keep)
+{
+    if (!cmdline) return;
+    command_t *cmd = cmdline->first_cmd;
+
+    while (cmd->cond != COND_ENDL && cmd->cond != COND_QUIT) {
+        command_t *old = cmd;
+        cmd = old->next;
+        command_clear(old, keep);
+    }
+    command_clear(cmd, keep);
+    if (!keep) free(cmdline);
+}
+// get the first command line with (id == n) from a sequence of cmdline
+// return the command line or NULL
+static cmdline_t* cmdline_seq_cmdline_get(cmdline_t *cmdline, int n)
+{
+    while (cmdline && cmdline->index != n)
+        cmdline = cmdline->next_line;
+    return cmdline;
+}
+// find the first command line with first command == string from a sequence of cmdline
+// return the command line or NULL
+static cmdline_t* cmdline_seq_cmdline_cmd_find(cmdline_t *cmdline, char *string)
+{
+    command_t *cmd;
+    while (cmdline && (cmd = cmdline->first_cmd)) {
+        char **argv = cmd->readed.arg.argv;
+        if (argv && strcmp(argv[0], string) == 0) break;
+        cmdline = cmdline->next_line;
+    }
+    return cmdline;
+}
+// find the first command line including string from a sequence of cmdline
+// return the command line or NULL
+static cmdline_t* cmdline_seq_cmdline_arg_find(cmdline_t *cmdline, char *string)
+{
+    while (cmdline) {
+        command_t *cmd = cmdline->first_cmd;
+        while (cmd) {
+            char **argv = cmd->readed.arg.argv;
+            if (argv)
+                while (*argv)
+                    if (strcmp(*argv++, string) == 0)
+                        return cmdline;
+            for (int i = 0; i < cmd->readed.in.count; i++)
+                if (strcmp(cmd->readed.in.redir[i].value, string) == 0)
+                    return cmdline;
+            for (int i = 0; i < cmd->readed.out.count; i++)
+                if (strcmp(cmd->readed.out.redir[i].value, string) == 0)
+                    return cmdline;
+            for (int i = 0; i < cmd->readed.err.count; i++)
+                if (strcmp(cmd->readed.err.redir[i].value, string) == 0)
+                    return cmdline;
+            cmd = cmd->next;
+        }
+        cmdline = cmdline->next_line;
+    }
+    return cmdline;
+}
+// delete the first command line with (id == n) from a sequence of cmdline
+// return a sequence without such command line
+static cmdline_t* cmdline_seq_cmdline_delete(cmdline_t *cmdline, int n)
+{
+    if (!cmdline) return NULL;
+    if (cmdline->index == n) {
+        cmdline_t* res = cmdline->next_line;
+        cmdline_clear(cmdline, 0);
+        return res;
+    }
+    cmdline->next_line = cmdline_seq_cmdline_delete(cmdline->next_line, n);
+    return cmdline;
+}
+// traverse a sequence of command lines and clear or delete (depend on keep)
+static void cmdline_seq_clear(cmdline_t *cmdline, int keep)
+{
+    while (cmdline) {
+        cmdline_t *next_line = cmdline->next_line;
+        cmdline_clear(cmdline, keep);
+        cmdline = next_line;
+    }
+}
+// End of command line type and functions
+
+////////////////////////////////////////////////////////////////////////////////
+// End of shell types, variables and supporting functions
+////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Management of environment and local vars
+////////////////////////////////////////////////////////////////////////////////
+
+// Local vars management (types, variables and supporting functions)
+typedef char* (localentry_t)[2];
+typedef struct {
+    localentry_t *var;
+    int size;
+    int aloc;
+} localvars_t;
+
+static void vars_set_var(localvars_t *vars, localentry_t* var) {vars->var = var;}
+static localentry_t* vars_get_var(localvars_t *vars) {return vars->var;}
+static void vars_set_aloc(localvars_t *vars, int aloc) {vars->aloc = aloc;}
+static int vars_get_aloc(localvars_t *vars) {return vars->aloc;}
+static void vars_set_size(localvars_t *vars, int size) {vars->size = size;}
+static int vars_get_size(localvars_t *vars) {return vars->size;}
+static void vars_set_key(localvars_t *vars, int pos, char *key) {vars->var[pos][0] = key;}
+static char* vars_get_key(localvars_t *vars, int pos) {return (vars->var[pos][0]);}
+static void vars_set_value(localvars_t *vars, int pos, char *val) {vars->var[pos][1] = val;}
+static char* vars_get_value(localvars_t *vars, int pos) {return (vars->var[pos][1]);}
+
+static int vars_find_key(localvars_t *vars, const char *key)
+{
+    localentry_t* var = vars_get_var(vars);
+    int size = vars_get_size(vars);
+    for (int i = 0; i < size; i++)
+        if (strcmp(var[i][0], key) == 0)
+            return i;
+    return -1;
+}
+
+static int setvar(localvars_t *vars, const char *key, const char *value)
+{
+    if (!key || !*key) return 0;
+    int pos = vars_find_key(vars, key);
+    if (pos == -1) {
+        pos = vars_get_size(vars);
+        int aloc = vars_get_aloc(vars);        
+        if (pos == aloc) {
+            int newaloc = aloc + 10;
+            localentry_t *newvar = (localentry_t*)realloc(vars_get_var(vars), newaloc*sizeof(localentry_t));
+            if (newvar == NULL) {
+                errno = ENOMEM;
+                return -1;
+            }
+            vars_set_var(vars, newvar);
+            vars_set_aloc(vars, aloc);
+        }
+        vars_set_key(vars, pos, strdup(key));
+        vars_set_size(vars, pos + 1);
+    } else {
+        free(vars_get_value(vars, pos));
+    }
+    vars_set_value(vars, pos, (value)? strdup(value): NULL);
+    return 0;
+}
+
+static int unsetvar(localvars_t *vars, const char *key)
+{
+    if (!key || !*key) return -1;
+    int size = vars->size;
+    int pos = vars_find_key(vars, key);
+    if (pos == -1) return -1;
+    free(vars_get_key(vars, pos));
+    free(vars_get_value(vars, pos));
+    int last = size - 1;
+    if (pos < last) {
+        vars_set_key(vars, pos, vars_get_key(vars, last));
+        vars_set_value(vars, pos, vars_get_value(vars, last));
+    }
+    vars_set_size(vars, last);
+    return 0;
+}
+
+static char* getvar(localvars_t *vars, const char *key)
+{
+    if (!key || !*key) return NULL;
+    int pos = vars_find_key(vars, key);
+    if (pos == -1) return NULL;
+    return vars_get_value(vars, pos);
+}
+
+static char* getkey(localvars_t *vars, int pos)
+{
+    if (pos == -1) return NULL;
+    if (pos >= vars_get_size(vars)) return NULL;
+    return vars_get_key(vars, pos);
+}
+// End of local vars management
+
+
+
+
+
+// Shell structure to hold local vars
+static localvars_t localvars = (localvars_t){ NULL, 0, 0 };
+
+// Environment management: userland interface
+static int main_env(int argc, char *argv[])
+{
+    extern char **environ;
+    char **env = environ;
+    while (*env) printf("%s\n",*env++);
+    return 0;
+}
+
+static int main_export(int argc, char *argv[])
+{
+    extern char **environ;
+    char **env = environ;
+    if (argc == 1) return main_env(0, NULL);
+    if (argv[1][0] == '-') {
+        if (argv[1][1] == 'p') {
+            while (*env) printf("export %s\n", *env++);
+            return 0;
         } else {
-            // Emulate line discipline, reading char by char, in case stdin was redirected from a file
-            inputBuffer[0]='\0';
-            length = 0;
-            char c = 0;
-            long l = 0;
-            do{
-                c=0;
-                l=read(STDIN_FILENO, &c, 1);
-                if (l>0) {
-                    inputBuffer[length] = c;
-                    inputBuffer[length+1] = '\0';
-                    length++;
-                }
-            } while ((l>0) && (length<MAX_LINE-2) && (c!='\n'));
-            if ((length>=MAX_LINE-2) && (c!='\n')){
-                inputBuffer[length] = '\n';
-                inputBuffer[length+1] = '\0';
-                length++;
-            }
+            fprintf(stderr,"%s: bad option: -%c\n", argv[0], argv[1][1]);
+            return -1;
         }
-        inputBuffer_next = NULL;
     }
-
-	start = -1;
-	if (length == 0)
-	{
-		printf("\nBye\n");
-		exit(0);            /* ^D was entered, end of user command stream */
-	}
-	if (length < 0){
-		perror("error reading the command");
-		exit(-1);           /* terminate with error code of -1 */
-	}
-
-    int instring = 0; // Arguments with spaces can be quoted by '\"'
-
-	/* examine every character in the inputBuffer */
-	for (i=0;i<length;i++)
-	{
-        char cc = inputBuffer[i];
-		//switch (cc)
-		//{
-        //case '\"':
-        if ('\"' == cc) {
-            if (!instring) {
-                instring = 1;
-            } else {
-				//if (start != -1) {
-                    args[ct] = &inputBuffer[start];
-                    ct++;
-                //}
-                inputBuffer[i] = '\0';
-                start = -1;
-                instring = 0;
-            }
-        }
-		//case ' ':
-		//case '\t' :
-        else if (' ' == cc || '\t' == cc) {
-            /* argument separators */
-            if (!instring) {
-                if(start != -1)
-                {
-                    args[ct] = &inputBuffer[start];    /* set up pointer */
-                    ct++;
-                }
-                inputBuffer[i] = '\0'; /* add a null char; make a C string */
-                start = -1;
-            } else {
-                // Proceed with spaces as another common char
-			    if (start == -1) start = i;  // start of new argument
-            }
-        }
-		//case '\n':                 /* should be the final char examined */
-        //case ';':
-        //case '&':
-        else if ('\n' == cc
-                 || '\0' == cc
-                 || '#'  == cc
-                 || ((';' == cc || '&' == cc) && (!instring))) {
-            /* should be the final char examined */
-			if (start != -1)
-			{
-				args[ct] = &inputBuffer[start];
-				ct++;
-			}
-
-            inputBuffer_next = NULL;
-            if (';' == cc || '&' == cc || '\n' == cc) {
-                inputBuffer_next = &inputBuffer[i+1];
-                *separator = cc;
-            }
-
-			inputBuffer[i] = '\0';
-            // no more arguments to this sub-command
-			args[ct] = NULL;
-
-            if ('#' == cc || '\0' == cc) {
-                // Ignore from this point: it is a comment or the string ends (only
-                // when stdin redirected)
-                length = i;
-                inputBuffer_next = NULL;
-                break;
-            }
-        }
-		//default :             /* some other character */
-        else {
-            /* some other character */
-			//-- if (inputBuffer[i] == '&') // background indicator
-			//-- {
-            //--     *separator = cc;
-			//-- 	if (start != -1)
-			//-- 	{
-			//-- 		args[ct] = &inputBuffer[start];
-			//-- 		ct++;
-			//-- 	}
-			//-- 	inputBuffer[i] = '\0';
-			//-- 	args[ct] = NULL; /* no more arguments to this command */
-			//-- 	i=length; // make sure the for loop ends now
-
-			//-- }
-			//-- else
-            if (start == -1) start = i;  // start of new argument
-		}
-
-        if (*separator) break; // A separator found, a subcommand ends here
-	}  // end for
-	args[ct] = NULL; /* just in case the input line was > MAXLINE */
-    return ct;
+    char *key = argv[1];
+    char *value = strchr(argv[1], '=');
+    if (!value) {
+        value = getvar(&localvars, key);
+        if (!value) return -1;
+    } else {
+        *value++ = '\0';
+        if (!*key) return -1;
+    }
+    int ret = setenv(key, value, 1);
+    if (ret == -1) {
+        char buff[256];
+        snprintf(buff, 256, "%s: %s", argv[0], "setenv");
+        perror(buff);
+    }
+    return ret;
 }
 
-
-
-static char buff[BUFSIZ];
-static void replace_status(int argc, char *argv[], int status)
+static int main_set(int argc, char *argv[])
 {
-    snprintf(buff,BUFSIZ,"%d",status);
-    for (int i=0; i < argc; i++) {
-        if (strcmp("$?", argv[i]) == 0) {
-            argv[i] = buff;
+    if (argc == 1) {
+        int size = vars_get_size(&localvars);
+        for (int i = 0; i < size; i++)
+            printf("%s=%s\n", vars_get_key(&localvars, i), vars_get_value(&localvars, i));
+    }
+    return 0;
+}
+
+static int main_unset(int argc, char *argv[])
+{
+    return unsetvar(&localvars, argv[1]);
+}
+////////////////////////////////////////////////////////////////////////////////
+// End of environment
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+// history
+////////////////////////////////////////////////////////////////////////////////
+
+static cmdline_t *history = NULL;
+int history_index = 1;
+
+static void history_push(cmdline_t *cmdline)
+{
+    if (!cmdline) return;
+    cmdline->index = history_index++;
+    cmdline->next_line = history;
+    history = cmdline;
+}
+
+static cmdline_t* history_find_cmdline(char *inputstr)
+{
+    cmdline_t *cmdline = NULL;
+
+    if (!inputstr) return NULL;
+
+    size_t len = strnlen(inputstr, PATH_MAX-1);
+    char buff[PATH_MAX];
+    strncpy(buff, inputstr, len);
+    buff[len] = '\0';
+    char *str = buff;
+
+    if (len < 2) return NULL;
+
+    if (*str == '!') {   // ! => history command
+        cmdline_t *foundcmdline = NULL;
+        str++;
+        if (*str == '!') {        // !!
+            foundcmdline = cmdline_seq_cmdline_get(history, history_index - 1);
+        } else if (*str == '?') { // !?string
+            str++;
+            foundcmdline = cmdline_seq_cmdline_arg_find(history, str);
+        } else {
+            char *endptr;
+            int n = strtol(str, &endptr, 10);
+            if (n < 0) {                // !-n
+                foundcmdline = cmdline_seq_cmdline_get(history, n + history_index);
+            } else if (str == endptr) { // !string
+                foundcmdline = cmdline_seq_cmdline_cmd_find(history, str);
+            } else {                    // !n
+                foundcmdline = cmdline_seq_cmdline_get(history, n);
+            }
+        }
+        if (foundcmdline) {
+            cmdline = new_cmdline_copy(foundcmdline);
+            //if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) cmdline_print(cmdline);
+        } else {
+            fprintf(stderr, "Event not found: '%s'\n", str);
+            cmdline = new_cmdline(new_command());
         }
     }
+
+    return cmdline;
 }
 
-static void replace_env(int argc, char *argv[])
+static int main_history(int argc, char *argv[])
 {
-    for (int i=0; i < argc; i++) {
-        if ('$' == argv[i][0] && '\0' != argv[i][1]) {
-            char *e = getenv(&argv[i][1]);
-            if (e)
-                 argv[i] = e;
-            else
-                 argv[i] = "";
+    if (argc == 1) {
+        cmdline_seq_print(history);
+    }
+    else if (strcmp(argv[1], "-c") == 0) {
+        cmdline_seq_clear(history, 0);
+        history = NULL;
+        history_index = 1;
+    } else if (strcmp(argv[1], "-d") == 0) {
+        if (argc < 3) {
+            fprintf(stderr,"Missing command line number\n");
+            return 1;
         }
+        int k = atoi(argv[2]);
+        cmdline_seq_cmdline_delete(history, k);
     }
+    return 0;
 }
 
-static void ignore_comments(int *argc, char *argv[])
-{
-    int nargs = *argc;
-    for (int i=0; i < nargs; i++) {
-        if ( argv[i][0] == '#') {
-            argv[i] = NULL;
-            *argc = i;
-            break;
-        }
-    }
-}
-
-// Add a new argv[0], displacing the rest of the arguments
-// (argv[0]->argv[1], argv[1]->argv[2] ...)
-static int arg_add(int argc, char *argv[], char *arg0)
-{
-    long i = 1;
-    char *p = argv[0], *n;
-    while (argv[i] && i < MAX_LINE/2){
-        n = argv[i];
-        argv[i] = p;
-        p = n;
-        i++;
-    }
-    argv[0] = arg0;
-    argv[i] = p;
-    argv[i+1] = NULL;
-    return argc+1;
-}
+////////////////////////////////////////////////////////////////////////////////
+// End of history
+////////////////////////////////////////////////////////////////////////////////
 
 
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
 #define READ(fdi, buf, count)\
     ({\
         ssize_t ret = read(fdi, buf, count);\
@@ -419,12 +901,16 @@ static ssize_t COPY(int ifd, int ofd)
     char buf[BUFSIZ];
     ssize_t ret = 0;
     ssize_t rlen;
-
-    if ((!isatty(ifd) || !isatty(ofd)) && is_same_inode(ifd, ofd)){
+    struct stat statbufin, statbufout;
+    if (fstat(ifd, &statbufin)==0 &&
+        fstat(ofd, &statbufout)==0 &&
+        !S_ISCHR(statbufin.st_mode) &&
+        !S_ISCHR(statbufout.st_mode) &&
+        statbufin.st_ino == statbufout.st_ino) {
         fprintf(stderr, "input file is output file\n");
-        return 1;
+        return 0;
     }
-
+            
     while ((rlen = READ(ifd, buf, BUFSIZ)) > 0) {
         for (ssize_t off = 0; off < rlen; off += WRITE(ofd, buf+off, rlen-off));
         ret += rlen;
@@ -432,18 +918,1435 @@ static ssize_t COPY(int ifd, int ofd)
     return ret;
 }
 
-#define COPY_SLOW(id,od) do{int c;while((c=getc(id))!=EOF)putc(c,od);}while(0)
+static ssize_t COPY_ENDSTR(int ifd, int ofd, char *endstr)
+{
+    char buf[BUFSIZ];
+    ssize_t ret = 0;
+    ssize_t rlen = 0;
+    ssize_t endstrlen = strnlen(endstr, BUFSIZ);
+    ssize_t pos = 0;
+    int line_begins = 1;
+    while (READ(ifd, buf+pos, 1) > 0) {
+        rlen++;
+        if (buf[pos] == '\n' || rlen == BUFSIZ) {
+            if (line_begins && pos == endstrlen && strncmp(endstr, buf, endstrlen) == 0) break;
+            line_begins = (buf[pos] == '\n');
+            for (ssize_t off = 0; off < rlen; off += WRITE(ofd, buf+off, rlen-off));
+            ret += rlen;
+            rlen = 0;
+            pos = 0;
+        } else pos++;
+    }
+    return ret;
+}
+
+static void WRITE_STDOUT_ISATTY(const char *prompt)
+{
+    (void)(isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) &&
+            write(STDOUT_FILENO, prompt, strlen(prompt)));
+}
+
+static ssize_t read_stdin(char *buffer, ssize_t size)
+{
+    int interactive = isatty(STDIN_FILENO);
+    ssize_t off = 0;
+    do {
+        // when processing a file, read byte by byte
+        ssize_t len = read(STDIN_FILENO, buffer+off, (interactive)? size-off: 1);
+        if (len == 0){
+            WRITE_STDOUT_ISATTY("\nBye\n");
+            return 0; // ^d was entered, end of user command stream
+        } else if (len == -1){
+            perror("shell: read");
+            return -1;
+        }
+        off += len;
+    } while (off < size && buffer[off-1] != '\n' && buffer[off-1] != '\0');
+    //buffer[off-1]='\0';     // replacing '\n' by '\0' (not mandatory)
+    return off;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Parser
+//
+////////////////////////////////////////////////////////////////////////////////
+
+static command_t* get_command(char *inputBuffer, ssize_t size, int *offset, const char *prompt)
+{
+    int len;
+    int ii = *offset;   // loop index for reading inputBuffer array
+    int item_count = 0;
+    int next = -1;
+    int rtypefound = R_NO_REDIR;
+    int rtype = R_NO_REDIR;
+    int start = -1;
+    int argi[size/2];
+    int type[size/2];
+    cond_t cond = COND_ENDL;
+    int cnt[3];
+    cnt[0] = 0;
+    cnt[1] = 0;
+    cnt[2] = 0;
+
+#define QUIT                                \
+         do {                               \
+            command_t *cmd = new_command(); \
+            if (!cmd) return NULL;          \
+            cmd->cond = COND_QUIT;          \
+            return cmd;                     \
+        } while(0)
+
+#define READ_STDIN(buffer, size)            \
+    ({                                      \
+        int ret = read_stdin(buffer, size); \
+        if (ret <= 0) QUIT;                 \
+        ret;                                \
+    })
+
+    // if /n is ignored then pipe/cmdand/cmdor prompt are not aplied
+//    if (ii == -1 || inputBuffer[ii] == '\0') {
+    // if force read when \n or \0 then extra read occur with ls; or ls& (COND_SEQ/BACK)
+    if (ii == -1 || inputBuffer[ii] == '\n' || inputBuffer[ii] == '\0') {
+        if (ii == -1) ii = 0;
+        WRITE_STDOUT_ISATTY(prompt);
+        len = READ_STDIN(&inputBuffer[ii], size-ii-1) + ii;
+        inputBuffer[len] = '\0';
+//TODO: remove printk debug
+//printk("readed: '%s' (len: %d) (pos: %d)\n",&inputBuffer[ii],len,ii);
+    } else {
+        len = strnlen(&inputBuffer[ii], size-ii-1) + ii;
+//printk("received: '%s' (len: %d) (pos: %d)\n",&inputBuffer[ii],len,ii);
+//if (inputBuffer[len]=='\0') printk("Null terminator OK\n");
+//else printk("Missing Null terminator !!!\n");
+    }
+    inputBuffer[size-1] = '\0'; //in any case
+
+    int jj = ii;
+    unsigned char sep = 0;
+    while (ii < len) {
+        unsigned char c;
+        switch (inputBuffer[ii])
+        {
+        case '\0':
+//printk("case '\\0': [isatty? %d]\n",isatty(0));
+            if (!isatty(STDIN_FILENO)) QUIT;
+        case '\n':                          // no more to process: line ending
+            next = -1;
+            cond = COND_ENDL;
+        multiple:                           // no more to process: next command
+            while (isblank(inputBuffer[ii])) ii++;
+            if (jj + 1 < ii) {              // compact space
+//printk("Compact %d -> %d\n",ii, jj+1);
+                for (int cont = 0; ii + cont < len+1; cont++)
+                    inputBuffer[jj + 1 + cont] = inputBuffer[ii + cont];
+                if (next != -1) next = jj + 1;
+            }
+            if (inputBuffer[next] == '\n') {
+                next = -1;
+                if ((cond == COND_SEQ) || (cond == COND_BACK)) cond = COND_ENDL;
+            }
+//if (start != -1) printk("last item: '%s' (start: %d)\n",&inputBuffer[start], start);
+//if (next != -1) printk("delayed: '%s' (next: %d)\n",&inputBuffer[next], next);
+//else printk("nothing delayed\n");
+            len = ii;                       // pass through
+        redir:
+        case '\t':                          // argument separators
+        case ' ':                           // pass through
+            if (start != -1) {
+                inputBuffer[jj++] = '\0';
+                if (rtype & REDIR_BIT) {
+                   if ((rtype & REDIR_MASK) == 1) cnt[1]++;
+                   else if ((rtype & REDIR_MASK) == 2) cnt[2]++;
+                   else cnt[0]++;   // 00->file_in; 11->raw_input (or EOFstr)
+                }
+                argi[item_count] = start;
+                type[item_count++] = rtype;
+                start = -1;
+                rtype = R_NO_REDIR;
+            }
+            if (rtypefound != R_NO_REDIR) {
+                rtype = rtypefound;
+                rtypefound = R_NO_REDIR;
+            }
+            break;
+        case ';':
+            next = jj + 1;
+            cond = COND_SEQ;                // next command should be executed
+            ii++;
+            goto multiple;
+        case '|':
+            if (ii+1 < len && inputBuffer[ii+1] == '|') { // '||' logical OR
+                next = jj + 2;
+                cond = COND_OR;             // next cmd iff current fails
+                ii+=2;
+                goto multiple;
+            } else {                        // '|' pipe output for next cmd
+                next = jj + 1;
+                cond = COND_PIPE;           // next command should be executed
+                ii++;
+                goto multiple;
+            }
+            break;
+        case '&':
+            if (ii+1 < len && inputBuffer[ii+1] == '&'){  // '&&' logical AND
+                next = jj + 2;
+                cond = COND_AND;            // next cmd iff current succeeds
+                ii+=2;
+                goto multiple;
+            } else {                        // '&' no background -> treat as ';'
+                next = jj + 1;
+                cond = COND_BACK;           // next command should be executed
+                ii++;
+                goto multiple;
+            }
+            break;
+        case '(':                           // an argument itself (?)
+            sep = ')';
+            prompt = "> ";
+            goto string;
+        case '"':
+            sep = '"';                      // start quote (replace vars)
+            prompt = "dquote> ";
+            goto string;
+        case '\'':
+            sep = '\'';                     // start quote (literal)
+            prompt = "quote> ";
+        string:
+            if (start == -1) start = jj;
+            inputBuffer[jj++] = inputBuffer[ii++]; // copy separator: ( " '
+            while (ii < len) {
+                do {                        // deferred until command parsing
+                    c = inputBuffer[ii++];
+                    inputBuffer[jj++] = c;
+                } while (c != sep && c != '\n' && c != '\0' && ii < len);
+                if ((c == '\n' || c == '\0') && ii < size) { // multiline string (allow '\n' into string)
+                    WRITE_STDOUT_ISATTY(prompt);
+                    long tmp = READ_STDIN(&inputBuffer[ii], size-(ii));
+                    len += tmp;
+                    inputBuffer[jj - 1] = '\n'; // set '\n' instead of '\0'
+                }
+                if (c == sep) break;
+            }
+            ii--;
+            sep = 0;
+            break;
+        case '\\':                          // scape character
+            if (start == -1) start = jj;
+            c = inputBuffer[++ii];
+            inputBuffer[jj++] = c;
+            if ((c == '\n' || c == '\0') && ii < size) {   // multiline command line
+                WRITE_STDOUT_ISATTY("> ");
+                len += READ_STDIN(&inputBuffer[ii], size-(ii));
+                ii--;
+                jj--;
+            }
+            break;
+        case '<':
+            rtypefound = R_FILE_IN;
+            if (ii+1 < len && inputBuffer[ii+1] == '<') {
+                ii++;
+                rtypefound = R_RAWINPUT;
+                if (ii+1 < len && inputBuffer[ii+1] != '<') {
+                    rtypefound |= R_EOFINPUT;
+                } else { // <<<'string in stdin'
+                    ii++;
+                }
+            }
+            goto redir; 
+        case '1':
+            if (start != -1) goto general;
+            if (ii+1 < len && inputBuffer[ii+1] != '>') goto general;
+            ii++; // pass through
+        case '>':
+            rtypefound = R_FILE_OUT;
+            if (ii+1 < len && inputBuffer[ii+1] == '>') {
+                ii++;
+                rtypefound |= R_APPEND;
+            }
+            goto redir;            
+        case '2':
+            if (start != -1) goto general;
+            if (ii+1 < len && inputBuffer[ii+1] != '>') goto general;
+            ii++;
+            rtypefound = R_FILE_ERR;
+            if (ii+1 < len && inputBuffer[ii+1] == '>') {
+                ii++;
+                rtypefound |= R_APPEND;
+            }
+            goto redir;
+        case '#':
+            if (start == -1) {
+                cond = COND_ENDL;           // comments => end of line
+                len = ii;                   // exit loop
+                next = -1;                  // read next line
+                break;
+            }                               // pass throught
+        general:
+        default:                            // some other character
+            if (start == -1) start = jj;
+            if (jj != ii) inputBuffer[jj] = inputBuffer[ii];
+            jj++;
+        }   // end switch
+        ii++;
+    }   // end while
+
+    *offset = next;
+    command_t *cmd = new_command();
+    if (!cmd) return NULL;
+
+    cmd->cond = cond;
+    if (!item_count) return cmd;
+
+    redir_t *redir_in  = (redir_t*)malloc(cnt[0] * sizeof(redir_t));
+    redir_t *redir_out = (redir_t*)malloc(cnt[1] * sizeof(redir_t));
+    redir_t *redir_err = (redir_t*)malloc(cnt[2] * sizeof(redir_t));
+
+    int argc = item_count - cnt[0] - cnt[1] - cnt[2];
+    char **argv = (char**)malloc((argc + 1) * sizeof(char *));
+
+    int count_in = 0;
+    int count_out = 0;
+    int count_err = 0;
+    int count_argv = 0;
+    for (int i = 0; i < item_count; i++) {
+        char *value = strdup(inputBuffer + argi[i]);
+        int rtype = type[i];
+        if (rtype & REDIR_BIT) {
+            if ((rtype & REDIR_MASK) == 1) {
+                redir_out[count_out++] = (redir_t){ value, rtype };
+                continue;
+            }
+            if ((rtype & REDIR_MASK) == 2) {
+                redir_err[count_err++] = (redir_t){ value, rtype };
+                continue;
+            }
+            // rtype: 00->file_in; 11->raw input (or EOFstr)
+            redir_in[count_in++] = (redir_t){ value, rtype };
+            continue;
+        }
+        argv[count_argv++] = value;
+    }
+    // assert count_argv == argc
+    argv[argc] = NULL;
+    cmd->readed.arg.argc = argc;
+    cmd->readed.arg.argv = argv;
+    cmd->readed.in  = (redir_vect_t) { cnt[0], redir_in  };
+    cmd->readed.out = (redir_vect_t) { cnt[1], redir_out };
+    cmd->readed.err = (redir_vect_t) { cnt[2], redir_err };
+
+    return cmd;
+}
+
+static cmdline_t* get_line(const char *prompt)
+{
+    char workbuffer[MAX_LINE];
+    static int offset = -1;
+    cmdline_t *newcmdline;
+    
+    command_t *cmd;
+    do {
+        cmd = get_command(workbuffer, MAX_LINE, &offset, prompt);
+    } while (!cmd || (cmd->cond == COND_ENDL &&
+                        cmd->readed.arg.argc +
+                        cmd->readed.in.count +
+                        cmd->readed.out.count +
+                        cmd->readed.err.count == 0)); // avoid a void first cmd
+
+
+    char **argv = cmd->readed.arg.argv; // solve history references
+    cmdline_t *cmdline = (argv)? history_find_cmdline(*argv): NULL; // argv[0]
+
+    if (cmdline) {  // found => cmdline is a copy of that one in history
+        command_t *tmp = cmdline->first_cmd;
+        command_merge_input(tmp, cmd);
+        while(tmp->cond != COND_ENDL) tmp = tmp->next;
+        command_merge_output(tmp, cmd);
+        tmp->cond = cmd->cond;
+        command_clear(cmd, 0);
+        cmd = tmp;
+        newcmdline = cmdline;
+        if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) cmdline_print(cmdline);
+    } else {
+        newcmdline = new_cmdline(cmd);
+    }
+
+    while(cmd->cond != COND_ENDL && cmd->cond != COND_QUIT) {
+        const char *newprompt;
+        switch (cmd->cond) {
+            case COND_AND: newprompt = "cmdand> "; break;
+            case COND_OR:  newprompt = "cmdor> "; break;
+            case COND_PIPE:newprompt = "pipe> "; break;
+            default:  newprompt = prompt;
+        }
+        command_t *next;
+        do {
+            next = get_command(workbuffer, MAX_LINE, &offset, newprompt);
+        } while (!next);
+
+        argv = next->readed.arg.argv;
+        cmdline_t *cmdline = (argv)? history_find_cmdline(*argv): NULL;
+        if (cmdline) {  // found => cmdline is a copy of that one in history
+            command_t *tmp = cmdline->first_cmd;
+            free(cmdline);
+            cmd->next = tmp;
+            command_merge_input(tmp, next);
+            while(tmp->cond != COND_ENDL) tmp = tmp->next;
+            command_merge_output(tmp, next);
+            tmp->cond = next->cond;
+            command_clear(next, 0);
+            cmd = tmp;
+        } else {
+            cmd = cmd->next = next;
+        }
+
+    }
+
+    return newcmdline;
+}
+
+static int redirect_stream(int STDFILENO, const char *FILENAME, int FLAGS, mode_t MODE)
+{
+    int fd = openat(AT_FDCWD, FILENAME, FLAGS, MODE);
+    char buff[256];
+    if (fd != -1) {
+        if (dup2(fd, STDFILENO) != STDFILENO) {
+            snprintf(buff, 256, "%s: dup2: '%s' to fd=%d", __func__,
+                                FILENAME?:"TMPFILE", STDFILENO);
+            perror(buff);
+        }
+    } else {
+        snprintf(buff, 256, "%s: open: %s", __func__, FILENAME?:"TMPFILE");
+        perror(buff);
+    }
+    return fd;
+}
+
+
+static void save_default_streams(int *default_std_fd)
+{
+    default_std_fd[STDIN_FILENO]  = dup(STDIN_FILENO);
+    default_std_fd[STDOUT_FILENO] = dup(STDOUT_FILENO);
+    default_std_fd[STDERR_FILENO] = dup(STDERR_FILENO);
+}
+
+static int restore_default_stream(int fd, int std_fd)
+{
+    int res = std_fd;
+    if (std_fd != -1) res = dup2(std_fd, fd);
+    return res;
+}
+
+static void restore_default_streams(int *default_std_fd)
+{
+    restore_default_stream(STDERR_FILENO, default_std_fd[STDERR_FILENO]);
+    restore_default_stream(STDOUT_FILENO, default_std_fd[STDOUT_FILENO]);
+    restore_default_stream(STDIN_FILENO,  default_std_fd[STDIN_FILENO]);
+}
+
+static void close_default_streams(int *default_std_fd)
+{
+    close(default_std_fd[STDIN_FILENO]);
+    close(default_std_fd[STDOUT_FILENO]);
+    close(default_std_fd[STDERR_FILENO]);
+    default_std_fd[STDIN_FILENO]  = -1;
+    default_std_fd[STDOUT_FILENO] = -1;
+    default_std_fd[STDERR_FILENO] = -1;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// variable structure to save enviroment overwrited by local vars in a cmdline
+static localvars_t envrestore = (localvars_t){ NULL, 0, 0 };
+////////////////////////////////////////////////////////////////////////////////
+
+
+
+static char* parse_argument(char *arg)
+{
+    char buff[MAX_LINE];
+    int k = 0;
+    char sep = 0;
+    for (int j = 0; arg[j] != '\0'; j++) {
+        if (arg[j] == '\'') {       // remove "'", rest is litteral
+            char c;
+            do {
+                c = arg[++j];
+                buff[k++] = c;
+            } while (c != '\'' && c != '\0');
+            k--;
+        } else if (arg[j] == '"') { // remove '"', parse content of string
+            if (sep == '"') {
+                sep = 0;
+            } else if (!sep) {
+                sep = '"';
+            } else {                // other separator: ')'
+                buff[k++] = arg[j];
+            }
+        } else if (arg[j] == '\\') {
+            j++;
+            if (arg[j] == '\n') j++;
+            if (arg[j] == '\0') break;
+            buff[k++] = arg[j];
+        } else if (arg[j] == '$'){
+            j++;
+            if (arg[j] == '$') {
+                k += snprintf(&buff[k], MAX_LINE - k, "%s", getvar(&localvars,"$"));
+            } else {
+                char *tmp = strdup(&arg[j]);
+                char *key = tmp;
+                int cont = 0;
+                if (*key == '{') {
+                    key++;
+                    cont++;
+                }
+                char c;
+                do {
+                    c = tmp[cont++];
+                } while (c != ' ' && c != '\t' && c != '\n' && c != '\0' &&
+                        c != '$' && c != '\'' && c != '"' &&
+                        c != '(' && c != ')' && c != '}' && c != '*' /*&& c != '?'*/);
+                cont--;
+                tmp[cont] = '\0';
+                char *env = getenv(key);
+                if (!env) env = getvar(&localvars, key);
+                if (env) k += snprintf(&buff[k], MAX_LINE - k, "%s", env);
+                free(tmp);
+                if (c == '}') cont++;
+                j += cont-1;
+            }
+        } else {
+            buff[k++] = arg[j];
+        }
+    }
+    buff[k] = '\0';
+    return strdup(buff);
+}
+
+
+// expand wildcards (*,?) in redirections
+static redir_vect_t parse_redir_vector(redir_vect_t readed_redir_vect)
+{
+    int num_redirs = readed_redir_vect.count;
+    int size = num_redirs;
+    redir_t *redir_array = (redir_t*)malloc(size * sizeof(redir_t));
+    int count = 0;
+    for (int i = 0; i < num_redirs; i++) {
+        redir_t redir = readed_redir_vect.redir[i];
+        char *parsed_redir = parse_argument(redir.value);
+        glob_t globbuf;
+        glob(parsed_redir, GLOB_TILDE | GLOB_BRACE, NULL, &globbuf);
+        if (globbuf.gl_pathc == 0) {
+            redir_array[count++] = (redir_t){ parsed_redir, redir.type };
+        }
+        else if (globbuf.gl_pathc == 1) {
+            redir_array[count++] = (redir_t){ strdup(globbuf.gl_pathv[0]), redir.type };
+        }
+        else {
+            redir_t* newspace = (redir_t*)realloc(redir_array,
+                                (size + globbuf.gl_pathc) * sizeof(redir_t));
+            if (!newspace) {    // undo glob
+                redir_array[count++] = (redir_t){ parsed_redir, redir.type };
+                continue;                                       // next arg
+            }
+            redir_array = newspace;
+            size += globbuf.gl_pathc;
+            for (int i = 0; i < globbuf.gl_pathc; i++) {
+                redir_array[count++] = (redir_t){ strdup(globbuf.gl_pathv[i]), redir.type };
+            }
+        }
+        globfree(&globbuf);
+    }
+    return (redir_vect_t) { count:count, redir:redir_array };
+}
+
+// expand wildcards (*,?) in arguments
+static argument_t parse_argument_vector(int start, argument_t readed_argument_vect)
+{
+    int argn = readed_argument_vect.argc;
+    int size = argn - start + 1;
+    char **argument_array = (char**)malloc(size * sizeof(char*));
+    
+    int argc = 0;
+    for (int i = start; i < argn; i++) {
+        char *parsed_arg = parse_argument(readed_argument_vect.argv[i]);
+        glob_t globbuf;
+        glob(parsed_arg, GLOB_TILDE | GLOB_BRACE, NULL, &globbuf);
+        if (globbuf.gl_pathc == 0) {
+            argument_array[argc++] = parsed_arg;
+        }
+        else if (globbuf.gl_pathc == 1) {
+            argument_array[argc++] = strdup(globbuf.gl_pathv[0]);
+        }
+        else {
+            char **newspace = (char**)realloc(argument_array,
+                                (size + globbuf.gl_pathc) * sizeof(char*));
+            if (!newspace) {
+                argument_array[argc++] = parsed_arg;      // undo glob
+                continue;                                       // next arg
+            }
+            argument_array = newspace;
+            size += globbuf.gl_pathc;
+            for (int i = 0; i < globbuf.gl_pathc; i++) {
+                argument_array[argc++] = strdup(globbuf.gl_pathv[i]);
+            }
+        }
+        globfree(&globbuf);
+    }
+    argument_array[argc] = NULL;
+    return (argument_t){ argc, argument_array };
+}
+
+// Parse command from reusable data: readed arguments
+// Substitute/evaluate local vars: $?, $HOME, and other redirections: <<, <<<
+// Expand arguments using wildcards (*, ?)
+static int parse_command(command_t *cmd)
+{
+    // parse redirections, do this before local vars
+    cmd->parsed.in  = parse_redir_vector(cmd->readed.in );    // input
+    cmd->parsed.out = parse_redir_vector(cmd->readed.out);    // output
+    cmd->parsed.err = parse_redir_vector(cmd->readed.err);    // errors
+
+    // process local vars (and store overwrited enviroment vars to recover later)
+    int argn = cmd->readed.arg.argc;
+    char **argv = cmd->readed.arg.argv;
+    int index = argn;
+    for (int i = 0; i < argn; i++) {
+        char tmp[MAX_LINE];
+        strcpy(tmp, argv[i]);
+        char *key = tmp;
+        char *value = strchr(tmp, '=');
+        if (!value) {
+            index = i;
+            break;
+        }
+        *value++ = '\0';
+        char *newkey = parse_argument(key);
+        if (*newkey) {  // not empty
+            char *restore = getenv(newkey);
+            setvar(&envrestore, newkey, restore);
+            char *newval = parse_argument(value);
+            setenv(newkey, newval, 1);
+            free(newval);
+            free(newkey);
+        }
+    }
+
+    // if empty command after command vars, then set command var as local vars
+    if (index == argn) {
+        char *key;
+        while (NULL != (key = getkey(&envrestore, 0))) {
+            char *val = getenv(key);
+            setvar(&localvars, key, val);       // set as local vars
+            val = getvar(&envrestore, key);
+            if (val) {                          // restore environment
+                setenv(key, val, 1);
+            } else {
+                unsetenv(key);
+            }
+            unsetvar(&envrestore, key);
+        }
+    }
+
+    // current arguments once removed local vars from command
+    cmd->parsed.arg  = parse_argument_vector(index, cmd->readed.arg ); // args
+
+    return 0;
+}
+
+#define UNUSE_RESULT(code) do{ if (code) {} }while(0)
+static int redir_command(command_t *cmd, int *default_std_fd)
+{
+    // redir standard input combined from pipe, files, raw inputs (restore if none)
+    int num_redirs = cmd->parsed.in.count;
+    int prefdin = cmd->pipe;
+    int fdin = prefdin;
+    int count = 0;
+    char *mode = "r";
+    fflush(stdin);
+    for (int i = 0; i < num_redirs; i++) {
+        int rtype = cmd->parsed.in.redir[i].type;
+        char *value = cmd->parsed.in.redir[i].value;
+        if (fdin == -1) {                       // first redir and no pipe
+            if ((rtype & REDIR_MASK) == 0) {
+                fdin = open(value, O_RDONLY);
+                if (fdin != -1) count++;
+            } else {                            // raw imput, create TMP
+                prefdin = fdin;                 // use this TMP for the rest
+                fdin = open("/tmp", O_RDWR | O_TMPFILE, S_IRUSR | S_IWUSR);
+                if (fdin != -1) {
+                    count++;
+                    ssize_t error;
+                    if (rtype & R_EOFINPUT) {
+                        error = COPY_ENDSTR(STDIN_FILENO, fdin, value);
+                    } else {
+                        error = write(fdin, value, strlen(value));
+                        if (error >= 0) error = write(fdin, "\n", 1);
+                    }
+                    if (error < 0) {
+                        close(fdin);
+                        return -1;
+                    }
+                }
+            }
+            if (fdin == -1) // still -1
+            {
+                char buff[256];
+                snprintf(buff, 256, "redirection: open: '%s'", value);
+                perror(buff);
+                return -1;
+            }
+        } else if (prefdin == -1) {             // second redir, create TMP
+            prefdin = fdin;                     // use this TMP for the rest
+            fdin = open("/tmp", O_RDWR | O_TMPFILE, S_IRUSR | S_IWUSR);
+            if (fdin == -1) {
+                perror("redirection: open: interal TMP file");
+                return -1;
+            }
+            lseek(prefdin, 0, SEEK_SET);
+            ssize_t retval = COPY(prefdin, fdin);
+            close(prefdin);
+            if (retval < 0) {
+                close(fdin);
+                return -1;
+            }
+            if ((rtype & REDIR_MASK) == 0) {
+                int fd = open(value, O_RDONLY);
+                if (fd != -1) {
+                    count++;
+                    retval = COPY(fd, fdin);
+                    close(fd);
+                    if (retval < 0) {
+                        close(fdin);
+                        return -1;
+                    }
+                } else {
+                    char buff[256];
+                    snprintf(buff, 256, "redirection: open: '%s'", value);
+                    perror(buff);
+                    close(fdin);
+                    return -1;
+                }
+            } else {
+                count++;
+                ssize_t error;
+                if (rtype & R_EOFINPUT) {
+                    error = COPY_ENDSTR(STDIN_FILENO, fdin, value);
+                } else {
+                    error = write(fdin, value, strlen(value));
+                    if (error >= 0) error = write(fdin, "\n", 1);
+                }
+                if (error < 0) {
+                    close(fdin);
+                    return -1;
+                }
+            }
+        } else if ((rtype & REDIR_MASK) == 0) {   // following file redirs, use TMP
+            prefdin = open(value, O_RDONLY);
+            if (prefdin == -1) {
+                char buff[256];
+                snprintf(buff, 256, "redirection: open: '%s'", value);
+                perror(buff);
+                close(fdin);
+                return -1;
+            }
+            count++;
+            COPY(prefdin, fdin);
+            close(prefdin);
+        } else {                                // following raw input, use same TMP
+            count++;
+            ssize_t error;
+            if (rtype & R_EOFINPUT) {
+                error = COPY_ENDSTR(STDIN_FILENO, fdin, value);
+            } else {
+                error = write(fdin, value, strlen(value));
+                if (error >= 0) error = write(fdin, "\n", 1);
+            }
+            if (error < 0) {
+                close(fdin);
+                return -1;
+            }
+        }
+    }
+    if (fdin == -1) {
+        restore_default_stream(STDIN_FILENO, default_std_fd[STDIN_FILENO]);
+    } else {
+        lseek(fdin, 0, SEEK_SET);
+        dup2(fdin, STDIN_FILENO);
+        close(fdin);
+    }
+    cmd->count_redir[0] = count;
+    stdin = fdopen(STDIN_FILENO, mode); // FILE *stdin holds obsolete data => pipe or redirections
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    // redir standard output to file, pipe or both (restore if none)
+    int fdout = -1;
+    num_redirs = cmd->parsed.out.count;
+    if (cmd->cond != COND_PIPE && num_redirs == 1) {
+        char *value = cmd->parsed.out.redir[0].value;
+        int flags = O_CREAT | O_WRONLY;
+        int isAppend = cmd->parsed.out.redir[0].type & R_APPEND;
+        flags |= (isAppend)? O_APPEND: O_TRUNC;
+        mode = (isAppend)? "a": "w";
+        fdout = redirect_stream(STDOUT_FILENO, value, flags, S_IRUSR | S_IWUSR);
+        if (fdout != -1) close(fdout);
+        else return -1;
+    } else if (cmd->cond == COND_PIPE || num_redirs > 1) {
+        fdout = redirect_stream(STDOUT_FILENO, "/tmp", O_RDWR | O_TMPFILE, S_IRUSR | S_IWUSR);
+        mode = "w+"; //TODO: for stdout users (libc level), mode can be "w"
+        if (fdout != -1) close(fdout);
+        else return -1;
+        if (cmd->cond == COND_PIPE) cmd->next->pipe = dup(STDOUT_FILENO);
+    } else {
+        restore_default_stream(STDOUT_FILENO, default_std_fd[STDOUT_FILENO]);
+        mode = "w";
+    }
+    cmd->count_redir[1] = num_redirs;
+    stdout = fdopen(STDOUT_FILENO, mode);
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    // redir errors to file or restore
+    int fderr = -1;
+    //num_redirs = cmd->parsed.count_redir[2];
+    num_redirs = cmd->parsed.err.count;
+    if (num_redirs == 1) {
+        char *value = cmd->parsed.err.redir[0].value;
+        int flags = O_CREAT | O_WRONLY;
+        int isAppend = cmd->parsed.err.redir[0].type & R_APPEND;
+        flags |= (isAppend)? O_APPEND: O_TRUNC;
+        mode = (isAppend)? "a": "w";
+        fderr = redirect_stream(STDERR_FILENO, value, flags, S_IRUSR | S_IWUSR);
+        if (fderr != -1) close(fderr);
+        else return -1;
+    } else if (num_redirs > 1) {
+        fderr = redirect_stream(STDERR_FILENO, "/tmp", O_RDWR | O_TMPFILE, S_IRUSR | S_IWUSR);
+        mode = "w+"; //TODO: for stderr users (libc level), mode can be "w"
+        if (fderr != -1) close(fderr);
+        else return -1;
+    } else {
+        restore_default_stream(STDERR_FILENO, default_std_fd[STDERR_FILENO]);
+        mode = "w";
+    }
+    cmd->count_redir[2] = num_redirs;
+    stderr = fdopen(STDERR_FILENO, mode);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    return 0;
+}
+
+
+
+static int exec_command(command_t *cmd, cond_t *condp)
+{
+    *condp = cmd->cond;
+    if (*condp == COND_QUIT) return 0;
+    
+    char **argv = cmd->parsed.arg.argv;
+    int argc = cmd->parsed.arg.argc;
+
+    if (argc == 0 &&
+        !cmd->count_redir[0] &&
+        !cmd->count_redir[1] &&
+        !cmd->count_redir[2] &&
+        cmd->pipe == -1) return 0;
+
+    //let's do it!
+    int status;
+    if (!argc) status = COPY(STDIN_FILENO, STDOUT_FILENO);
+    else if (!strcmp("!", argv[0]))         status = main_history(argc, argv);
+    else if (!strcmp(".", argv[0]))         status = main_source(argc, argv);
+    else if (!strcmp("argv", argv[0]))      status = main_argv(argc, argv);
+    else if (!strcmp("basename", argv[0]))  status = main_bn(argc, argv);
+    else if (!strcmp("cat", argv[0]))       status = main_cat(argc, argv);
+    else if (!strcmp("cd", argv[0]))        status = main_cd(argc, argv);
+    else if (!strcmp("chmod", argv[0]))     status = main_chmod(argc, argv);
+    else if (!strcmp("close", argv[0]))     status = main_close(argc, argv);
+    else if (!strcmp("cmp", argv[0]))       status = main_cmp(argc, argv);
+    else if (!strcmp("cp", argv[0]))        status = main_cp(argc, argv);
+    else if (!strcmp("crc32", argv[0]))     status = main_crc32(argc, argv);
+    else if (!strcmp("dd", argv[0]))        status = main_dd(argc, argv);
+    else if (!strcmp("dir", argv[0]))       status = main_dir(argc, argv);
+    else if (!strcmp("dirname", argv[0]))   status = main_dn(argc, argv);
+    else if (!strcmp("du", argv[0]))        status = main_du(argc, argv);
+    else if (!strcmp("dup", argv[0]))       status = main_dup(argc, argv);
+    else if (!strcmp("dup2", argv[0]))      status = main_dup2(argc, argv);
+    else if (!strcmp("echo", argv[0]))      status = main_echo(argc, argv);
+    else if (!strcmp("env", argv[0]))       status = main_env(argc, argv);
+    else if (!strcmp("export", argv[0]))    status = main_export(argc, argv);
+    else if (!strcmp("fchmod", argv[0]))    status = main_fchmod(argc, argv);
+    else if (!strcmp("fchmodat", argv[0]))  status = main_fchmodat(argc, argv);
+    else if (!strcmp("fcmp", argv[0]))      status = main_fcmp(argc, argv);
+    else if (!strcmp("find", argv[0]))      status = main_find(argc, argv);
+    else if (!strcmp("ftruncate", argv[0])) status = main_ftruncate(argc, argv);
+    else if (!strcmp("glob", argv[0]))      status = main_glob(argc, argv);
+    else if (!strcmp("grep", argv[0]))      status = main_grep(argc, argv);
+    else if (!strcmp("help", argv[0]))      status = main_help(argc, argv);
+    else if (!strcmp("hexdump", argv[0]))   status = main_hexdump(argc, argv);
+    else if (!strcmp("history", argv[0]))   status = main_history(argc, argv);
+    else if (!strcmp("ioctl", argv[0]))     status = main_ioctl(argc, argv);
+    else if (!strcmp("linkat", argv[0]))    status = main_linkat(argc, argv);
+    else if (!strcmp("ln", argv[0]))        status = main_ln(argc, argv);
+    else if (!strcmp("ls", argv[0]))        status = main_ls(argc, argv);
+    else if (!strcmp("lsreel", argv[0]))    status = main_lsreel(argc, argv);
+    else if (!strcmp("lseek", argv[0]))     status = main_lseek(argc, argv);
+    else if (!strcmp("lsof", argv[0]))      status = main_lsof(argc, argv);
+    else if (!strcmp("meminfo", argv[0]))   status = main_meminfo(argc, argv);
+    else if (!strcmp("mkdir", argv[0]))     status = main_mkdir(argc, argv);
+    else if (!strcmp("mv", argv[0]))        status = main_mv(argc, argv);
+    else if (!strcmp("open", argv[0]))      status = main_open(argc, argv);
+    else if (!strcmp("openat", argv[0]))    status = main_openat(argc, argv);
+    else if (!strcmp("pwd", argv[0]))       status = main_pwd(argc, argv);
+    else if (!strcmp("read", argv[0]))      status = main_read(argc, argv);
+    else if (!strcmp("readlink", argv[0]))  status = main_readlink(argc, argv);
+    else if (!strcmp("realpath", argv[0]))  status = main_realpath(argc, argv);
+    else if (!strcmp("rename", argv[0]))    status = main_rename(argc, argv);
+    else if (!strcmp("renameat", argv[0]))  status = main_renameat(argc, argv);
+    else if (!strcmp("rm", argv[0]))        status = main_rm(argc, argv);
+    else if (!strcmp("rmdir", argv[0]))     status = main_rmdir(argc, argv);
+    else if (!strcmp("seekdir", argv[0]))   status = main_seekdir(argc, argv);
+    else if (!strcmp("set", argv[0]))       status = main_set(argc, argv);
+    else if (!strcmp("source", argv[0]))    status = main_source(argc, argv);
+    else if (!strcmp("stat", argv[0]))      status = main_stat(argc, argv);
+    else if (!strcmp("stty", argv[0]))      status = main_stty(argc, argv);
+    else if (!strcmp("tee",argv[0]))        status = main_tee(argc, argv);
+    else if (!strcmp("touch",argv[0]))      status = main_touch(argc, argv);
+    else if (!strcmp("tree", argv[0]))      status = main_tree(argc, argv);
+    else if (!strcmp("truncate", argv[0]))  status = main_truncate(argc, argv);
+    else if (!strcmp("type", argv[0]))      status = main_type(argc, argv);
+    else if (!strcmp("unset", argv[0]))     status = main_unset(argc, argv);
+    else if (!strcmp("umask", argv[0]))     status = main_umask(argc, argv);
+    else if (!strcmp("wc",argv[0]))         status = main_wc(argc, argv);
+    else if (!strcmp("write", argv[0]))     status = main_write(argc, argv);
+    else if (!strcmp("writechars", argv[0]))status = writechars(argc, argv);
+    // roae shell commands
+    else if (!strcmp("roae", argv[0]))      status = main_roae(argc, argv);
+    else if (!strcmp("siard", argv[0]))     status = main_siard(argc, argv);
+    else if (!strcmp("sqlite", argv[0]))    status = main_sqlite(argc, argv);
+    else if (!strcmp("unzip", argv[0]))     status = main_unzip(argc, argv);
+    // end roae shell cmds
+    else if (!strcmp("exit", argv[0]) || !strcmp("quit", argv[0])){
+        fprintf(stderr, "exit\n");
+        *condp = COND_QUIT;
+        status = 0;
+        if (argv[1]) status = atoi(argv[1]);
+    } else {                                status = main_spawn(argc, argv);}
+
+    char number[12];    // update local var
+    int id = atoi(getvar(&localvars, "$")) + 1;
+    snprintf(number, 12, "%d", id);
+    setvar(&localvars, "$", number);    // $$ -> command number
+    snprintf(number, 12, "%d", status);
+    setvar(&localvars, "?", number);    // $? -> last command status
+
+    return status;
+}
+
+// flush stdout and stderr if there are multiple redirections
+static void flush_command(command_t *cmd)
+{
+    // if stdout is redirected to more than one stream (files and/or pipe): lseek/COPY
+    fflush(stdout);
+    int count = cmd->count_redir[1];
+    if ((cmd->cond == COND_PIPE && count) || count > 1) {
+        for (int i = 0; i < count; i++) {
+            int flags = O_CREAT | O_WRONLY;
+            flags |= (cmd->parsed.out.redir[i].type & R_APPEND)? O_APPEND: O_TRUNC;
+            int fd = open(cmd->parsed.out.redir[i].value, flags, S_IWUSR | S_IRUSR);
+            if (fd == -1) {
+                char buff[256];
+                snprintf(buff, 256, "%s (out): open: %s", __func__, cmd->parsed.out.redir[i].value);
+                perror(buff);
+                continue;
+            }
+            lseek(STDOUT_FILENO, 0, SEEK_SET);
+            COPY(STDOUT_FILENO, fd);
+            close(fd);
+        }
+    }
+    // if stderr is redirected to more than one stream (files): lseek/COPY
+    fflush(stderr);
+    count = cmd->count_redir[2];
+    if (count > 1) {
+        for (int i = 0; i < count; i++) {
+            int flags = O_CREAT | O_WRONLY;
+            flags |= (cmd->parsed.err.redir[i].type & R_APPEND)? O_APPEND: O_TRUNC;
+            int fd = open(cmd->parsed.err.redir[i].value, flags, S_IWUSR | S_IRUSR);
+            if (fd == -1) {
+                char buff[256];
+                snprintf(buff, 256, "%s (err): open: %s", __func__, cmd->parsed.out.redir[i].value);
+                perror(buff);
+                continue;
+            }
+            lseek(STDERR_FILENO, 0, SEEK_SET);
+            COPY(STDERR_FILENO, fd);
+            close(fd);
+        }
+    }
+}
+
+// Restore environment vars overwrited by command vars
+static void clean_command(command_t *cmd)
+{
+    // restore environment (overwrited by local vars)
+    char *key;
+    while (NULL != (key = getkey(&envrestore, 0))) {
+        char *val = getvar(&envrestore, key);
+        if (val) {                      // restore environment
+            setenv(key, val, 1);
+        } else {
+            unsetenv(key);
+        }
+        unsetvar(&envrestore, key);
+    }
+    
+    command_clear(cmd, 1); // keep the readed arena
+}
+
+static cond_t exec_line(cmdline_t *cmdline, int *default_std_fd)
+{
+    cond_t cond;
+    int status;
+    command_t *nxt = cmdline->first_cmd;
+    command_t *cmd;
+    do {
+        cmd = nxt;
+        parse_command(cmd);
+        //command_print_verbose(cmd);
+        if (redir_command(cmd, default_std_fd) == -1) {
+            clean_command(cmd);
+            break;
+        }
+        status = exec_command(cmd, &cond);
+        flush_command(cmd);
+        nxt = cmd->next;
+        clean_command(cmd);
+    } while (cond == COND_SEQ || cond == COND_BACK || cond == COND_PIPE ||
+            (cond == COND_AND && status == 0) ||
+            (cond == COND_OR && status != 0));
+
+    restore_default_streams(default_std_fd);
+    return cond;
+}
+
+
+// -----------------------------------------------------------------------
+//                            MAIN
+// -----------------------------------------------------------------------
+int main(void)
+{
+    cond_t cond;
+    char prompt[PATH_MAX+3];
+
+    int default_std_fd[3] = {-1, -1, -1};
+    save_default_streams(default_std_fd);
+
+    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
+        printf("Type \"help\" for a list of commands.\n");
+        printf("Type \"quit\", \"exit [err]\" or ^D to exit.\n");
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+    // Termios tty configuration, use ICANON|ECHO if the tty
+    // where running this program has not ICANON nor ECHO.
+    struct termios tty;
+    ioctl(STDIN_FILENO, TCGETS, &tty);
+    tty.c_lflag |= ICANON | ECHO;
+    //tty.c_lflag &= ~ICANON & ~ECHO;
+    ioctl(STDIN_FILENO, TCSETS, &tty);
+
+    // Initialize sqlite shell
+    sqlite_shell_init();
+
+    setvar(&localvars, "$", "1");
+    setvar(&localvars, "?", "0");
+    do {
+        char *ptype = getvar(&localvars, "PROMPT");
+        if (ptype && atoi(ptype) == 1) {
+            strcpy(prompt, "> ");
+        } else {
+            snprintf(prompt, PATH_MAX+3, "%s> ", getcwd(cwd, PATH_MAX));
+        }
+        cmdline_t *cmdline = get_line(prompt);
+        if (!isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) cmdline_print(cmdline);
+        cond = exec_line(cmdline, default_std_fd);
+        if (isatty(STDIN_FILENO)) history_push(cmdline);
+    } while (cond != COND_QUIT);
+
+    close_default_streams(default_std_fd);
+
+    char *errval = getvar(&localvars, "?");    // $? -> last command status
+    int err = atoi(errval);
+    return err;
+}
+// End of shell
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Source functions
+////////////////////////////////////////////////////////////////////////////////
+static int main_source(int argc, char *argv[])
+{
+    cond_t cond;
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <script_file>\n", argv[0]);
+        return -1;
+    }
+    int fd = open(argv[1], O_RDONLY);
+    if (fd == -1) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: %s", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;
+    }
+    dup2(fd, STDIN_FILENO);
+    close(fd);
+
+    int default_std_fd[3] = {-1, -1, -1};
+    save_default_streams(default_std_fd);
+    do {
+        cmdline_t *cmdline = get_line("SOURCE> "); // TODO: prompt should be NULL
+        cond = exec_line(cmdline, default_std_fd);
+        cmdline_clear(cmdline, 0);
+    } while (cond != COND_QUIT);
+    close_default_streams(default_std_fd);
+
+    char *errval = getvar(&localvars, "?");    // $? -> last command status
+    int err = atoi(errval);
+    return err;
+}
+// End of Source
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Path functions
+////////////////////////////////////////////////////////////////////////////////
+
+// Use checkpath() to check if the 'pathname' part is a valid directory where
+//     create new 'basename' file or directorio
+// resolve absolute file name; all but the last component must exist
+char* checkpath(const char *name, char *canon_name) //TODO static (used is shell.c for test)
+{
+    char *p;
+    const char *base_name;
+    const char *pathname;
+    char buff[PATH_MAX];
+    struct stat st;
+    
+    strcpy(buff, name);
+    pathname = dirname(buff);
+    p = strrchr((char *)name, '/');
+    if (p) {
+        base_name = p+1; // base_name is '' if input name is '/'; function basename() returns '/'
+    } else {
+        base_name = name;
+    }
+    if (base_name[0] == '\0' ||                             // ''
+        (base_name[0] == '.' && (base_name[1] == '\0' ||    // '.'
+        (base_name[1] == '.' && base_name[2] == '\0')))) {  // '..'
+        errno = EINVAL;
+        return NULL;
+    }
+    if (!realpath(pathname, canon_name)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    if (lstat(canon_name, &st) < 0) { // should never happen
+        errno = ENOENT;
+        return NULL;
+    }
+    if (! S_ISDIR(st.st_mode)) { // it's a regular file or symlink
+        errno = ENOTDIR;
+        return NULL;    
+    }
+    if (canon_name[1]) strcat(canon_name, "/"); // avoid '//'
+    //if (base_name[0] != '/') strcat(canon_name, base_name); // avoid '//' if function 'basename()'nis used
+    strcat(canon_name, base_name);
+    return canon_name;
+}
+
+// no path components need exist or be a directory
+static int resolve_softpath(char *path, char *result, char *pos)
+{
+    if (*path == '/') {
+        *result = '/';
+        pos = result+1;
+        path++;
+    }
+    *pos = 0;
+    if (!*path) return 0;
+    while (1) {
+        char *slash;
+        slash = *path ? strchr(path,'/') : NULL;
+        if (slash) *slash = 0;
+        if (!path[0] || (path[0] == '.' &&
+           (!path[1] || (path[1] == '.' && !path[2])))) {
+            pos--;
+            if (pos != result && path[0] && path[1])
+                while (*--pos != '/');
+        }
+        else {
+            strcpy(pos,path);
+            pos = strchr(result,0);
+        }
+        if (slash) {
+            *pos++ = '/';
+            path = slash+1;
+        }
+        *pos = 0;
+        if (!slash) break;
+    }
+    return 0;
+}
+
+// no path components need exist or be a directory
+static char* softpath(const char *__restrict path, char *__restrict resolved_path)
+{
+    char cwd[PATH_MAX];
+    char *path_copy;
+    int res;
+    errno = 0;
+    if (!*path) {
+        errno = ENOENT; /* SUSv2 */
+        return NULL;
+    }
+    int allocated = 0;
+    if (resolved_path == NULL) {
+        // If  resolved_path is specified as NULL, then realpath() uses malloc(3)
+        // to allocate a buffer of up to PATH_MAX bytes to hold the resolved
+        // pathname, and returns a pointer to this buffer
+        allocated = 1;
+        resolved_path = (char * __restrict)malloc(PATH_MAX*sizeof(char));
+        if (!resolved_path) return NULL;
+    }
+    #ifndef __ivm64__
+        if (!getcwd(cwd,sizeof(cwd))) {
+            if (allocated) free(resolved_path); 
+            return NULL;
+        }
+        strcpy(resolved_path, "/");
+        if (resolve_softpath(cwd, resolved_path, resolved_path)) {
+            if (allocated) free(resolved_path); 
+            return NULL;
+        }
+        strcat(resolved_path, "/");
+    #else
+        if (*path != '/') {
+            if (!getcwd(cwd,sizeof(cwd))) {
+                if (allocated) free(resolved_path); 
+                return NULL;
+            }
+            strcpy(resolved_path, "/");
+            if (resolve_softpath(cwd, resolved_path, resolved_path)){
+                if (allocated) free(resolved_path); 
+                return NULL;
+            }
+            if (strcmp(resolved_path, "/") != 0) strcat(resolved_path, "/");
+        } else {
+            strcpy(resolved_path, "/");
+        }
+    #endif
+    path_copy = strdup(path);
+    if (!path_copy) return NULL;
+    res = resolve_softpath(path_copy, resolved_path, strchr(resolved_path,0));
+    free(path_copy);
+    if (res) {
+        if (allocated) free(resolved_path);
+        return NULL;
+    }
+    if (!*resolved_path) strcat(resolved_path, "/");
+    return resolved_path;
+}
+
+static int main_cd(int argc, char *argv[])
+{
+    char *d;
+    if (argc==1) {
+        d = getenv("HOME");
+        if (!d) d = (char *)"/";
+    } else d = argv[1];
+
+    char buff[PATH_MAX];
+    softpath(d, buff);
+    int c = chdir(d);
+    if (c) {
+        int errsv = errno;
+        if (chdir(".")) strcpy(cwd, "(unreachable)");
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: chdir: %s", argv[0], d);
+        errno = errsv;
+        perror(errbuff);
+    }
+    d = getcwd(cwd, PATH_MAX);
+    printf("Changed to dir '%s'\n", d);
+    return c;
+}
+////////////////////////////////////////////////////////////////////////////////
+// End of path function
+////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// ACTIONS
+
+#define SIZEDIFER -1
+#define ERR_READ1 -2
+#define ERR_READ2 -3
+
+static ssize_t fcmp(int fd1, int fd2)
+{
+    char buf1[BUFSIZ];
+    char buf2[BUFSIZ];
+    struct stat st;
+
+    if (fd1 == fd2) {
+        printf("Same file descriptor\n");
+        return 0;
+    }
+
+    fstat(fd1, &st);
+    unsigned long ino1 = st.st_ino;
+    ssize_t size1 = st.st_size;
+    
+    fstat(fd2, &st);
+    if (ino1 == st.st_ino) {
+        printf("Same file\n");
+        return 0;
+    }
+    if (size1 != st.st_size) return SIZEDIFER;
+
+    int count = 0;
+    do {
+        ssize_t count1 = 0;
+        ssize_t count2 = 0;
+        do {
+            int nread = read(fd1, buf1, BUFSIZ);
+            if (nread == -1) return ERR_READ1;
+            if (nread == 0) break;
+            count1 += nread;
+        } while (count1 < BUFSIZ);
+        do {
+            int nread = read(fd2, buf2, BUFSIZ);
+            if (nread == -1) return ERR_READ2;
+            if (nread == 0) break;
+            count2 += nread;
+        } while (count2 < BUFSIZ);
+        if (count1 != count2) {
+            return MIN(count1, count2);
+        }
+        int i;
+        for (i = 0; i < count1; i++)
+            if (buf1[i] != buf2[i]) break;
+        count += i;
+        if (i < count1) return count;
+    } while (count < size1);
+    
+    return 0;
+}
+
+static int main_fcmp(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s fildes1 fildes2\n", argv[0]);
+        return -1;
+    }
+    char errbuff[256];
+    errno = 0;
+    int fd1 = strtol(argv[1], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: strtol: %s", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;
+    }
+    errno = 0;
+    int fd2 = strtol(argv[2], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: strtol: %s", argv[0], argv[2]);
+        perror(errbuff);
+        return -1;
+    }
+    int ret = fcmp(fd1, fd2);
+    
+    switch (ret) {
+        case SIZEDIFER:
+            fprintf(stderr, "%s: fildes %d and %d difer in size\n",
+                            argv[0], fd1, fd2);
+            return -1;
+        case ERR_READ1:
+            snprintf(errbuff, 256, "%s: read: fildes %d", argv[0], fd1);
+            break;
+        case ERR_READ2:
+            snprintf(errbuff, 256, "%s: read: fildes %d", argv[0], fd2);
+            break;
+        case 0: break;
+        default:
+            fprintf(stderr, "%s: fildes %d and %d difer in byte %d\n",
+                            argv[0], fd1, fd2, ret);
+            return -1;
+    }
+    if (ret) perror(errbuff);
+    return ret;
+}
+
+static int main_cmp(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s FILE1 FILE2\n", argv[0]);
+        return -1;
+    }
+    char errbuff[256];
+    int fd1 = open(argv[1], O_RDONLY);
+    if (fd1 == -1) {
+        snprintf(errbuff, 256, "%s: open: '%s'", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;
+    }
+    int fd2 = open(argv[2], O_RDONLY);
+    if (fd2 == -1) {
+        snprintf(errbuff, 256, "%s: open: '%s'", argv[0], argv[2]);
+        perror(errbuff);
+        close(fd1);
+        return -1;
+    }
+    int ret = fcmp(fd1, fd2);
+    
+    switch (ret) {
+        case SIZEDIFER:
+            fprintf(stderr, "%s: files '%s' and '%s' difer in size\n",
+                            argv[0], argv[1], argv[2]);
+            ret = 1;
+            break;
+        case ERR_READ1:
+            snprintf(errbuff, 256, "%s: read: '%s'", argv[0], argv[1]);
+            break;
+        case ERR_READ2:
+            snprintf(errbuff, 256, "%s: read: '%s'", argv[0], argv[2]);
+            break;
+        case 0: break;
+        default:
+            fprintf(stderr, "%s: files '%s' and '%s' difer in byte %d\n",
+                            argv[0], argv[1], argv[2], ret);
+            ret = 1;
+            break;
+    }
+    if (ret < 0) perror(errbuff);
+    close(fd1);
+    close(fd2);
+    return ret;
+}
+
+
 static int main_cat(int argc, char *argv[])
 {
     int fd;
     int ret = 0;
 
-    // use strace to check the beaviour
-    //setvbuf(stdout, NULL, _IONBF, 0);
-    //setvbuf(stdin, NULL, _IONBF, 0);
-
     if (argc == 1) {
-        int n = COPY(STDIN_FILENO, STDOUT_FILENO); // not affected by libc buffering mode
+        int n = COPY(STDIN_FILENO, STDOUT_FILENO);
         if (n == -1) {
             char buff[256];
             snprintf(buff, 256, "%s: read: STDIN_FILENO", argv[0]);
@@ -455,7 +2358,6 @@ static int main_cat(int argc, char *argv[])
             perror(buff);
             ret = 1;
         }
-//        COPY_SLOW(stdin,stdout);
     } else {
         for (int i = 1; i < argc; i++)
         {
@@ -467,15 +2369,389 @@ static int main_cat(int argc, char *argv[])
                 ret++;
                 continue;
             }
-            COPY(fd, 1);
+            COPY(fd, STDOUT_FILENO);
             close(fd);
         }
     }
     return ret;
 }
 
+static int main_tee(int argc, char *argv[])
+{
+    int fd[argc];
+    int flags = O_CREAT | O_WRONLY;
 
-static int echo(int argc, char *argv[])
+    if (argc > 1 && strcmp(argv[1], "-a") == 0) {
+        flags |= O_APPEND;
+        argv++;
+        argc--;
+    } else {
+        flags |= O_TRUNC;
+    }
+
+    int nfd = 0;
+    fd[nfd++] = STDOUT_FILENO;
+    for (int i = 1; i < argc; i++) {
+        int fdo;
+        fdo = open(argv[i], flags, S_IRUSR | S_IWUSR);
+        if (fdo == -1) {
+            char buff[256];
+            snprintf(buff, 256, "%s: open: %s", argv[0], argv[2]);
+            perror(buff);
+            return -4;
+        }
+        fd[nfd++] = fdo;
+    }
+
+    char buf[BUFSIZ];
+    ssize_t ret = 0;
+    ssize_t rlen;
+    while ((rlen = READ(STDIN_FILENO, buf, BUFSIZ)) > 0) {
+        for (int i = 0; i < nfd; i++) {
+            ssize_t off = 0;
+            do {
+                off += WRITE(fd[i], buf + off, rlen - off);
+            } while (off < rlen);
+        }
+        ret += rlen;
+    }
+
+    for (int i = 1; i < nfd; i++) close(fd[i]);
+
+    return 0;
+}
+
+static int copyat(int dirorigfd, char *orig, int dirdestfd, char *dest)
+{
+    int fdi, fdo;
+
+    fdi = openat(dirorigfd, orig, O_RDONLY);
+    if (fdi == -1) return -3;
+    struct stat st;
+    if (fstat(fdi, &st) == -1) {
+        close(fdi);
+        return -4;
+    }
+    fdo = openat(dirdestfd, dest, O_CREAT | O_WRONLY | O_TRUNC, st.st_mode);
+    if (fdo == -1) {
+        close(fdi);
+        return -5;
+    }
+    int res = COPY(fdi, fdo); // 0: ok, -1: READ, -2: WRITE
+    close(fdi);
+    close(fdo);
+    return (res < 0)? res: 0;
+}
+
+static int main_cp(int argc, char *argv[])
+{
+    #define BUFFSIZE (PATH_MAX*2)
+    char buff[BUFFSIZE];
+    if (argc < 3) {
+        fprintf(stderr, "Usage: cp SOURCE DEST\n");
+        fprintf(stderr, "\tCopy SOURCE to DEST, or copy SOURCE(s) to DIRECTORY\n");
+        return -1;
+    }
+    int nsources = argc - 2;
+    char *source = argv[1];
+    char *dest = argv[argc-1];
+    struct stat st;
+    int dest_is_dir = ((fstatat(AT_FDCWD, dest, &st, 0) == 0) && (S_ISDIR(st.st_mode)));
+
+    // if there is a source and a destination then 'try as is'
+    if (nsources == 1 && !dest_is_dir) {
+        int res = copyat(AT_FDCWD, source, AT_FDCWD, dest);
+        switch (res) {
+            error_out: perror(buff);
+            case 0:    return res;
+            case -1:   snprintf(buff, BUFFSIZE, "%s: read: %s", argv[0], source);
+                       goto error_out;
+            case -2:   snprintf(buff, BUFFSIZE, "%s: write: %s", argv[0], source);
+                       goto error_out;
+            case -3:   snprintf(buff, BUFFSIZE, "%s: open: %s", argv[0], source);
+                       goto error_out;
+            case -4:   snprintf(buff, BUFFSIZE, "%s: fstat: %s", argv[0], source);
+                       goto error_out;
+            // res == -5, dest may be directory
+            default:   break;
+        }
+    }
+    // is dest directory?
+    if (!dest_is_dir) {
+        snprintf(buff, BUFFSIZE, "target '%s' is not a directory\n", dest);
+        perror(buff);
+        return -2;
+    }
+
+    int err = 0;
+    char dir_buf[PATH_MAX];
+    char *directory = realpath(dest, dir_buf);
+    for (int i = 1; i < argc-1; i++) {
+        strncpy(buff, argv[i], BUFFSIZE-1);
+        source = basename(buff);
+        char newname[PATH_MAX];
+        snprintf(newname, PATH_MAX, "%s/%s", directory, source);
+        if (copyat(AT_FDCWD, argv[i], AT_FDCWD, newname) < 0) {
+            if (fstatat(AT_FDCWD, argv[i], &st, AT_SYMLINK_NOFOLLOW) == -1) {
+                snprintf(buff, BUFFSIZE, "%s: cannot stat (source) '%s'", argv[0], argv[i]);
+                perror(buff);
+                err++;
+            } else if (fstatat(AT_FDCWD, dest, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+                snprintf(buff, BUFFSIZE, "%s: cannot stat (dest) '%s'", argv[0], dest);
+                perror(buff);
+                err++;		
+            } else {    // access problem? permision denied?
+                snprintf(buff, BUFFSIZE, "%s: cannot copy '%s' to '%s'", argv[0], argv[i], dest);
+                perror(buff);
+                err++;
+            }
+        }
+    }
+    return err; 
+}
+
+// CRC32 from https://gist.github.com/timepp/1f678e200d9e0f2a043a9ec6b3690635
+//
+// usage: the following code generates crc for 2 pieces of data
+// uint32_t table[256];
+// crc32_generate_table(table);
+// uint32_t crc = crc32_update(table, 0, data_piece1, len1);
+// crc = crc32_update(table, crc, data_piece2, len2);
+// output(crc);
+
+static uint32_t crc32_table[256];
+static void crc32_generate_table(uint32_t* table)
+{
+    uint32_t polynomial = 0xEDB88320;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (size_t j = 0; j < 8; j++) {
+            if (c & 1) {
+                c = polynomial ^ (c >> 1);
+            }
+            else {
+                c >>= 1;
+            }
+        }
+        table[i] = c;
+    }
+}
+
+static uint32_t crc32_update(uint32_t* table, uint32_t initial, const void* buf, size_t len)
+{
+    uint32_t c = initial ^ 0xFFFFFFFF;
+    const uint8_t* u = (const uint8_t*)(buf);
+    for (size_t i = 0; i < len; ++i) {
+        c = crc32_table[(c ^ u[i]) & 0xFF] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+static uint32_t crc32_compute(const char* filename, int *err)
+{
+    errno =0;
+    *err = 1;
+    static int do_table = 1;
+    if (do_table){
+        crc32_generate_table(crc32_table);
+        do_table = 0;
+    }
+    uint32_t crc = 0;
+    int fh = open(filename, O_RDONLY);
+    if (fh>=0) {
+        uint8_t buff[256];
+        ssize_t r = 1;
+        while ( 0 < (r = read(fh, buff, 256))) {
+            crc = crc32_update(crc32_table, crc, buff, r);
+        }
+        close(fh);
+        if (!errno) {
+            *err = 0;
+        }
+    }
+    return crc;
+}
+
+static int main_crc32(int argc, char *argv[])
+{
+    if (argc < 2) {
+        printf("Compute the CRC32 hash of a file.\nUsage:\n");
+        printf("       %s <filename>\n", argv[0]);
+        return -1;
+    }
+    int err = 1;
+    uint32_t crc = crc32_compute(argv[1], &err);
+    if (!err) printf("%08x\n", crc);
+}
+
+
+static int main_dd(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s if=<input file> of=<output file> [count=<num item>] [bs=<tam item>]\n",argv[0]);
+        return -1;
+    }
+    char *comm = *argv++;
+    char *ifname = NULL, *ofname = NULL;
+    unsigned long bs = 512;
+    unsigned long count = 0;
+    ssize_t nbytes = -1; //the entire file, until EOF (rlen == 0)
+    while (*argv) {
+        if ((argv[0][0]=='i')&&(argv[0][1]=='f')&&(argv[0][2]=='=')) {
+            ifname = &argv[0][3];
+        } else if ((argv[0][0]=='o')&&(argv[0][1]=='f')&&(argv[0][2]=='=')) {
+            ofname = &argv[0][3];
+        } else if ((argv[0][0]=='b')&&(argv[0][1]=='s')&&(argv[0][2]=='=')) {
+            bs = atol(&argv[0][3]);
+        } else if (strncmp(argv[0],"count=",6)==0) {
+            count = atol(&argv[0][6]);
+        } else {
+            fprintf(stderr,"Invalid argument: '%s'\n",argv[0]);
+        }
+        argv++;
+    }
+    if (!ifname || !*ifname) {
+        fprintf(stderr, "Missing input file\n");
+        return -1;
+    }
+    if (!ofname || !*ofname) {
+        fprintf(stderr, "Missing output file\n");
+        return -1;
+    }
+    if (bs == 0) {
+        fprintf(stderr, "Invalid value for bs\n");
+        return -1;
+    }
+    if (count) {
+        nbytes = bs * count;
+    }
+
+    int ret = 0;
+    char errbuff[256];
+    int fdi = open(ifname, O_RDONLY);
+    if (fdi == -1) {
+        snprintf(errbuff, 256, "%s: open: %s", comm, ifname);
+        ret = -1;
+    }
+    int fdo = open(ofname, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fdo == -1) {
+        snprintf(errbuff, 256, "%s: open: %s", comm, ofname);
+        ret = -1;
+    }
+    ssize_t rlen = 0, acc = 0;
+    while (ret != -1 && (nbytes == -1 || nbytes > acc)) {
+        char buf[bs];
+        if ((rlen = read(fdi, buf, bs)) <= 0) break;
+        ssize_t off = 0;
+        do {
+            if ((ret = write(fdo, buf + off, rlen - off)) < 0) break;
+            off += ret;
+        } while (off < rlen);
+        acc += off;
+    }
+    if (ret == -1) {
+        snprintf(errbuff, 256, "%s: write", comm);
+    }
+    if (rlen == -1) {
+        snprintf(errbuff, 256, "%s: read", comm);
+        ret = -1;
+    }
+    if (ret != -1) fprintf(stdout, "Transferred %ld\n", acc);
+    else perror(errbuff);
+
+    if (fdi != -1) close(fdi);
+    if (fdo != -1) close(fdo);
+    return ret;
+}
+
+static int main_rename(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <oldpath> <newpath>\n", argv[0]);
+        return 1;
+    }
+    int ret = rename(argv[1], argv[2]);
+    if (ret == -1) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: rename %s %s", argv[0], argv[1], argv[2]);
+        perror(errbuff);
+        return 2;
+    }
+    return 0;
+}
+
+static int main_renameat(int argc, char *argv[])
+{
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s <olddirfd> <oldpath> <newdirfd> <newpath>\n", argv[0]);
+        return 1;
+    }
+    errno = 0;
+    long olddirfd = strtol(argv[1], NULL, 10);
+    if (errno) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: olddirfd: %s", argv[0], argv[1]);
+        perror(errbuff);
+        return 2;
+    }
+    long newdirfd = strtol(argv[3], NULL, 10);
+    if (errno) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: newdirfd: %s", argv[0], argv[3]);
+        perror(errbuff);
+        return 2;
+    }
+    int ret = renameat(olddirfd, argv[2], newdirfd, argv[4]);
+    if (ret == -1) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: renameat: %ld %s %ld %s", argv[0],
+                         olddirfd, argv[2], newdirfd, argv[4]);
+        perror(errbuff);
+        return 2;
+    }
+    return 0;
+}
+
+static void usage_ln(char *name)
+{
+    fprintf(stderr, "Usage: %s [-s] <oldfile> <newfile>\n",name);
+    return;
+}
+
+static int main_ln(int argc, char *argv[])
+{
+    int status = 1;
+    int (*link_func)(const char *, const char*);
+    const char *func_name;
+    char *comm_name = *argv++;
+    argc--;
+    if (!argc) {
+        usage_ln(comm_name);
+        return 1;
+    }
+    if (strcmp(*argv,"-s") == 0) {
+        argv++;
+        argc--;
+        link_func = symlink;
+        func_name = "symlink";
+    } else {
+        link_func = link;
+        func_name = "link";
+    }
+    if (argc < 2) {
+        usage_ln(comm_name);
+        return -1;
+    }
+    status = link_func(argv[0], argv[1]);    
+    if (status < 0){
+        char buff[256];
+        snprintf(buff,256,"%s: %s: %s",comm_name,func_name,argv[0]);
+        perror(buff);
+    }
+    return status;
+}
+
+static int main_echo(int argc, char *argv[])
 {
     int endl = 1;
     argc--;
@@ -485,7 +2761,7 @@ static int echo(int argc, char *argv[])
         argc--;
         argv++;
     }
-    if (*argv) printf("%s", *argv++);
+    if (*argv) printf("%s",*argv++);
     while (*argv) printf(" %s",*argv++);
     if (endl) printf("\n");
     return 0;
@@ -499,50 +2775,18 @@ static int main_pwd(int argc, char *argv[])
         return -1;
     }
     char *w;
-    char buff[PATH_MAX];
-    w = getcwd(buff, PATH_MAX-1);
-    // w = getwd(buff); // FAIL ???
-    //w = get_current_dir_name(); // This calls malloc()
+    w = getcwd(cwd, PATH_MAX-1);
     if (!w) {
         perror("getwd");
-        fprintf(stderr, "Function getwd() FAILED!\n");
+        printf("Function getwd() FAILED!\n");
         return -1;
     }
     printf("%s\n", w);
-    //free(w); // Free w if got by get_current_dir_name
     return 0;
 }
 
-static int main_cd(int argc, char *argv[])
-{
-    char *d;
-    if (argc==1) {
-        d = getenv("HOME");
-        if (!d) d = "/";
-    } else d = argv[1];
 
-    int c = chdir(d);
-    if (c) {
-        fprintf(stderr, "Changing to dir '%s' FAILED!\n", d);
-        return c;
-    }
-    fprintf(stderr, "Successfuly changed to dir '%s'\n", d);
-    return 0;
-}
 
-// As cd using an open file number corresponding
-// to a directory open with opendir
-static int main_fcd(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Usage: %s dirfd\n",argv[0]);
-        return -1;
-    }
-    int fd = atoi(argv[1]);
-    int status = fchdir(fd);
-    if (status) {perror("fchdir");}
-    return status;
-}
 
 // Recursive mkdir (mkdir of all parents)
 static int rmkdir(char *dir, mode_t mode)
@@ -577,18 +2821,68 @@ static int rmkdir(char *dir, mode_t mode)
     }
 }
 
+// int largest_memory_chunck(int high, int low, int steps)
+//      Returns the size of the largest memory chunck available.
+//      The search start in 2^high (HIGHER_BIT set to 48 in macro) and goes
+//      iteratively down making a number of 'steps' refinement
+static unsigned long largest_memory_chunck(int high, int low, int steps)
+{
+    unsigned long base = 0;
+    long incr;
+    void *ptr;
+    int refine = 0;
+    for (incr = (1UL << high); incr >= (1UL << low); incr >>= 1) {
+        //printf("Trying: %ld (%ld + %ld)\n", base + incr, base, incr);
+        ptr = malloc(base + incr);
+        if (ptr) {
+        //printf("\tGot: %ld (at: %p)\n", base + incr, ptr);
+            free(ptr);
+            ptr = NULL;
+            base += incr;
+            if (refine++ >= steps) break;
+        }
+    }
+    return base;
+}
+
+#define HIGHER_BIT 48
+#define LOWER_BIT  10
+#define MAX_REFINEMENT 50
+static int main_meminfo(int argc, char *argv[])
+{
+    void *p = sbrk(0);
+    unsigned long space = ((unsigned long)&p-(unsigned long)p);
+    printf("STACK: %p\nHEAP:  %p\nSpace between both: %ld (%#lx)\n", &p, p, space, space);
+    unsigned long size = 0;
+    void *ptr = NULL;
+    int high = HIGHER_BIT;
+    int low = LOWER_BIT;
+    int steps = MAX_REFINEMENT;
+    switch (argc) {
+        case 4: steps = atoi(argv[3]);
+        case 3: low = atoi(argv[2]);
+        case 2: high = atoi(argv[1]);
+        default:
+    }
+    printf("Exploring dinamic memory with high=%d, low=%d and refinement=%d\n", high, low, steps);
+    size = largest_memory_chunck(high, low, steps);    
+    printf("Max. memory chuck available: %ld\n", size);
+    free(ptr);
+    return 0;
+}
+
 static int main_mkdir(int argc, char *argv[])
 {
     if (argc < 2) {
-        printf("Usage: %s directory\n", argv[0]);
-        printf("       %s -p directory\n", argv[0]);
+        fprintf(stderr, "Usage: %s directory\n", argv[0]);
+        fprintf(stderr, "       %s -p directory\n", argv[0]);
         return -1;
     }
     char *d;
     long m;
     if (!strcmp(argv[1], "-p")) {
         if (argc < 3) {
-            printf("Missing directory name\n");
+            fprintf(stderr, "Missing directory name\n");
             return -1;
         }
         d = argv[2];
@@ -598,126 +2892,34 @@ static int main_mkdir(int argc, char *argv[])
         m = mkdir(d, 0777);
     }
     if (m == -1) {
-        perror("mkdir");
-        fprintf(stderr, "Creating directory '%s' FAILED!\n", d);
+        char buff[256];
+        snprintf(buff, 256, "%s: mkdir: creating directory '%s' FAILED!", argv[0], d);
+        perror(buff);
         return -1;
     }
-    fprintf(stderr, "Directory '%s' just created\n", d);
+    fprintf(stderr, "Directory '%s' just created\n", d);// TODO: comment this line
     return 0;
 }
 
-static int main_glob(int argc, char *argv[])
+static int main_rmdir(int argc, char *argv[])
 {
-// int glob(const char *pattern, int flags,
-//                 int (*errfunc) (const char *epath, int eerrno),
-//                 glob_t *pglob);
-//
-// void globfree(glob_t *pglob);
-//
-// DESCRIPTION
-//        The  glob()  function  searches  for all the pathnames matching
-//        pattern according to the rules used by the shell (see glob(7)).  No
-//        tilde expansion or parameter substitution is done; if you want these,
-//        use wordexp(3).
-//
-//        The globfree() function frees the dynamically allocated storage from
-//        an earlier call to glob().
-//
-//        The results of a glob() call are stored in the structure pointed to
-//        by pglob.  This structure is of type glob_t (declared in <glob.h>)
-//        and includes the  following  elements  defined  by  POSIX.2 (more may
-//        be present as an extension):
-//
-//            typedef struct {
-//                size_t   gl_pathc;    /* Count of paths matched so far  */
-//                char   **gl_pathv;    /* List of matched pathnames.  */
-//                size_t   gl_offs;     /* Slots to reserve in gl_pathv.  */
-//            } glob_t;
-//
-    if (argc <= 1) {
-        printf("List directories or files using glob wildcards\n");
-        printf("Usage: %s <glob expression>\n", argv[0]);
+    if (argc == 1) {
+        fprintf(stderr, "Usage: %s directory\n", argv[0]);
         return -1;
     }
-    char *globexpr = argv[1];
-    glob_t globbuf;
-
-    glob(globexpr, GLOB_TILDE|GLOB_BRACE, NULL, &globbuf);
-
-    for (long k=0; k<globbuf.gl_pathc && globbuf.gl_pathv[k]; k++){
-        printf("%s ", globbuf.gl_pathv[k]);
+    char *d = argv[1];
+    long m = rmdir(d);
+    if (m == -1) {
+        char buff[256];
+        snprintf(buff, 256, "%s: rmdir: erasing directory '%s' FAILED!", argv[0], d);
+        perror(buff);
+        return -1;
     }
-    puts("");
-
-    globfree(&globbuf);
-
+    fprintf(stderr, "Directory '%s' just removed\n", d);// TODO: comment this line
     return 0;
 }
 
-static int main_setenv(int argc, char *argv[])
-{
-    if (argc < 3) {
-        printf("Assign/change an environment variable's value: varname=value\n");
-        printf("Usage: %s varname value\n", argv[0]);
-        return -1;
-    }
-    return setenv(argv[1], argv[2], 1);
-}
-
-static int main_unsetenv(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Delete the variable 'varname' from the environment\n");
-        printf("Usage: %s varname\n", argv[0]);
-        return -1;
-    }
-    return unsetenv(argv[1]);
-}
-
-static int main_getenv(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Get an environment variable\n");
-        printf("Usage: %s varname\n", argv[0]);
-        return -1;
-    }
-
-    char *v = getenv(argv[1]);
-    if (v) printf("%s\n", v);
-    return 0;
-}
-
-static int main_env(int argc, char *argv[])
-{
-    extern char **environ;
-    int i=0;
-    while (environ[i] && i<(1<<24)){
-        printf("%s\n", environ[i]);
-        i++;
-    }
-    return 0;
-}
-
-
-static int main_mkdirat(int argc, char *argv[])
-{
-    if (argc < 3) {
-        printf("Create a directory at a given directory open with opendir\n");
-        printf("Usage: %s dirfd pathname\n", argv[0]);
-        return -1;
-    }
-    int dirfd = atoi(argv[1]);
-    char *pathname = argv[2];
-    int m = mkdirat(dirfd, pathname, 0777);
-    if (m){
-        fprintf(stderr, "Making dir '%s' @ dirfd=%d FAILED!\n", pathname, dirfd);
-        perror("openat");
-        return -1;
-    }
-    fprintf(stderr, "Created dir '%s' @ dirfd=%d\n", pathname, dirfd);
-    return 0;
-}
-
+#ifdef __ivm64__
 // Recursive rm (like rm -rf)
 // To be safer, only path whose realpath contains needle are deleted
 static int rrm_needle(char *path, char *needle)
@@ -797,13 +2999,14 @@ static int rrm(char *path)
 {
     return rrm_needle(path, NULL);
 }
+#endif
 
-// To test unlink
-static int main_unlink(int argc, char *argv[]) {
+static int main_rm(int argc, char *argv[])
+{
     if (argc < 2) {
-        printf("Delete (unlink) files\n");
-        printf("Usage: %s file_to_delete1 file_to_delete2 ...\n", argv[0]);
-        printf("       %s -r directory  # recursive deletion, only for ivm64\n", argv[0]);
+        fprintf(stderr, "Delete (unlink) files\n");
+        fprintf(stderr, "Usage: %s file_to_delete1 file_to_delete2 ...\n", argv[0]);
+        fprintf(stderr, "       %s -r directory  # recursive deletion \n", argv[0]);
         return -1;
     }
     int recursive = !strcmp("-r", argv[1]);
@@ -824,8 +3027,9 @@ static int main_unlink(int argc, char *argv[]) {
             name = argv[i];
             int ret = unlink(name);
             if (ret < 0){
-                perror("unlink");
-                fprintf(stderr, "Removing file '%s' FAILED!\n", name);
+                char buff[256];
+                snprintf(buff, 256, "%s: unlink: %s", argv[0], name);
+                perror(buff);
                 status |= ret;
             }
         }
@@ -833,75 +3037,70 @@ static int main_unlink(int argc, char *argv[]) {
     return status;
 }
 
-// To test unlinkat
-static int main_unlinkat(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("Delete (unlink) a file at a given directory open with opendir\n");
-        printf("Usage: %s dirfd filename\n", argv[0]);
-        return -1;
-    }
-    int dirfd = atoi(argv[1]);
-    char *pathname = argv[2];
-    int m = unlinkat(dirfd, pathname, 0UL);
-    if (m){
-        fprintf(stderr, "Deleting file '%s' @ dirfd=%d FAILED!\n", pathname, dirfd);
-        perror("openat");
-        return -1;
-    }
-    fprintf(stderr, "File '%s' @ dirfd=%d\n", pathname, dirfd);
-    return 0;
-}
 
-// To test link
-static int main_symlink(int argc, char *argv[]) {
-    if (argc < 4) {
-        printf("Create a soft-link file2 -> file1\n");
-        printf("Usage: %s -s file1 file2\n", argv[0]);
-        return -1;
-    }
-    if (strcmp(argv[1], "-s")) {
-         fprintf(stderr, "Only soft links supported yet, use -s as 2nd. argument\n");
-         return -1;
-    }
-    char *name1 = argv[2];
-    char *name2 = argv[3];
-    int ret = symlink(name1, name2);
-    if (ret < 0){
-        perror("symlink");
-    }
-    return ret;
-}
+/* recursive du (like du -s) */
+#define HUMANSIZE(x) ((double)(((x)>1e12)?((x)/1.0e12):((x)>1e9)?((x)/1.0e9):((x)>1.0e6)?((x)/1.0e6):((x)>1e3)?((x)/1.0e3):(x)))
+#define HUMANPREFIX(x)  (((x)>1e12)?"T":((x)>1e9)?"G":((x)>1e6)?"M":((x)>1e3)?"K":"")
 
-// To test linkat
-static int main_symlinkat(int argc, char *argv[]) {
-    if (argc < 4) {
-        printf("Create a soft-link at open directory: file2@dirfd -> file1\n");
-        printf("Usage: %s file1 dirfd file2\n", argv[0]);
-        return -1;
-    }
-    char *name1 = argv[1];
-    int dirfd = atoi(argv[2]);
-    char *name2 = argv[3];
-    int ret = symlinkat(name1, dirfd, name2);
-    if (ret < 0){
-        perror("symlinkat");
-    }
-    return ret;
-}
-
-// To test rename
-static int main_rename(int argc, char *argv[])
+static long rdu(char *path)
 {
-    if (argc < 3) {
-         printf("Usage: %s oldname newname\n", argv[0]);
-         return 1;
+    if (!path || !*path) return 0; // Null or empty string: do nothing
+
+    char d[PATH_MAX];
+    //strcpy(d, path);
+    softpath(path, d);
+
+    // If path is file or link, the size can be taken directly
+    struct stat s;
+    int serr = lstat(d, &s);  // p->d_name is the base name (not the full name)
+    if (!serr && !S_ISDIR(s.st_mode)) {
+        return s.st_size;
     }
-    int ret = rename(argv[1], argv[2]);
-    if (ret == -1){
-         perror("rename");
-         fprintf(stderr, "Renaming '%s' -> '%s' FAILED!\n", argv[1], argv[2]);
+
+    // It must be a directory at this point
+
+    // Scan directory
+    struct dirent **files;
+    int nfiles = scandir(d, &files, NULL, alphasort);
+    if (nfiles == -1) {
+        fprintf(stderr, "error scanning '%s'\n", d);
+        perror("scandir");
+        return -1;
     }
-    return ret;
+
+    // Save current directory
+    char currwd[PATH_MAX];
+    char *w = getcwd(currwd, PATH_MAX);
+    if (!w) { perror("getcwd"); return -1; }
+
+    // Count size of children recursively
+    long size = 0;
+    if (chdir(d) == 0) {
+        for (long k=0; k<nfiles; k++){
+            struct dirent *dd = files[k];
+            // Ignore . and .. , to avoid infinite recursion
+            if (strcmp(dd->d_name, ".") && strcmp(dd->d_name, "..")) {
+                long dsize = rdu(dd->d_name);
+                size += dsize;
+            }
+            free(dd);
+        }
+        if (chdir(w) < 0) return -1;
+        printf("%ld\t(%.2f%sB) \t%s\n", size, HUMANSIZE(size), HUMANPREFIX(size), d);
+    }
+    free(files);
+    return size;
+}
+
+static int main_du(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Total disk usage in bytes of a directory\n");
+        fprintf(stderr, "Usage: %s <dir_name> \n", argv[0]);
+        return -1;
+    }
+    long size = rdu(argv[1]);
+    printf("%ld\t(%.2f%sB) \ttotal\n", size, HUMANSIZE(size), HUMANPREFIX(size));
+    return 0;
 }
 
 
@@ -910,8 +3109,8 @@ static int main_mv(int argc, char *argv[])
     #define BUFFSIZE (PATH_MAX*2)
     char buff[BUFFSIZE];
     if (argc < 3) {
-        printf("Usage: mv SOURCE DEST\n");
-        printf("\tRename SOURCE to DEST, or move SOURCE(s) to DIRECTORY\n");
+        fprintf(stderr, "Usage: mv SOURCE DEST\n");
+        fprintf(stderr, "\tRename SOURCE to DEST, or move SOURCE(s) to DIRECTORY\n");
         return -1;
     }
     int nsources = argc - 2;
@@ -959,321 +3158,231 @@ static int main_mv(int argc, char *argv[])
 }
 
 
-static int copyat(int dirorigfd, char *orig, int dirdestfd, char *dest)
+
+
+static int usage_realpath(char *comm)
 {
-    int fdi, fdo;
-
-    fdi = openat(dirorigfd, orig, O_RDONLY);
-
-    int fdro = openat(dirdestfd, dest, O_RDONLY);
-    if (fdro > 0 && is_same_inode(fdi, fdro)){
-        // Check in read-only if they are the same file to not overwrite destination
-        fprintf(stderr, "input file is output file\n");
-        close(fdro);
-        return -10;
-    }
-    close(fdro);
-
-    if (fdi == -1) return -3;
-    fdo = openat(dirdestfd, dest, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (fdo == -1) {
-        close(fdi);
-        return -4;
-    }
-    int res = COPY(fdi,fdo); // 0: ok, -1: READ, -2: WRITE
-    close(fdi);
-    close(fdo);
-    return (res < 0)? res: 0;
+    fprintf(stderr, "Usage: %s [-e][-m] FILE\n", comm);
+    fprintf(stderr, "\t all but the last component of the real path must exist\n");
+    fprintf(stderr, "\t -e all components of the path must exist\n");
+    fprintf(stderr, "\t -m no path components need exist or be a directory\n");
+    return -1;
 }
-
-static int main_cp(int argc, char *argv[])
+static int main_realpath(int argc, char *argv[])
 {
-    #define BUFFSIZE (PATH_MAX*2)
-    char buff[BUFFSIZE];
-    if (argc < 3) {
-        printf("Usage: cp SOURCE DEST\n");
-        printf("\tCopy SOURCE to DEST, or copy SOURCE(s) to DIRECTORY\n");
+    if (argc == 1) return usage_realpath(argv[0]);
+    char *output, *input, buff[PATH_MAX];
+    if (strcmp(argv[1],"-e") == 0) { //all components of the path must exist
+        input = argv[2];
+        if (!input) return usage_realpath(argv[0]);
+        output = realpath(input, buff);
+    } else if (strcmp(argv[1],"-m") == 0) { // no path components need exist or be a directory
+        input = argv[2];
+        if (!input) return usage_realpath(argv[0]);
+        output = softpath(input, buff); // esto no es una 'syscall'
+    } else { // all but the last component must exist
+        input = argv[1];
+        output = checkpath(input, buff); // esto no es una 'syscall'
+    }
+    if (!output) {
+        char errbuff[PATH_MAX];
+        snprintf(errbuff, PATH_MAX, "realpath: '%s'", input);
+        perror(errbuff);
         return -1;
     }
-    int nsources = argc - 2;
-    char *source = argv[1];
-    char *dest = argv[argc-1];
-    struct stat st;
-    int dest_is_dir = ((fstatat(AT_FDCWD, dest, &st, 0) == 0) && (S_ISDIR(st.st_mode)));
-
-    // if there is a source and a destination then 'try as is'
-    if (nsources == 1 && !dest_is_dir) {
-        int res = copyat(AT_FDCWD, source, AT_FDCWD, dest);
-        switch (res) {
-            error_out: perror(buff);
-            case 0:    return res;
-            case -1:   snprintf(buff, BUFFSIZE, "%s: read: %s", argv[0], source);
-                       goto error_out;
-            case -2:   snprintf(buff, BUFFSIZE, "%s: write: %s", argv[0], source);
-                       goto error_out;
-            case -3:   snprintf(buff, BUFFSIZE, "%s: open: %s", argv[0], source);
-                       goto error_out;
-            // res == -4, dest may be directory
-            default:   break;
-        }
-    }
-    // is dest directory?
-    if (!dest_is_dir) {
-        snprintf(buff, BUFFSIZE, "target '%s' is not a directory\n", dest);
-        perror(buff);
-        return -2;
-    }
-
-    int err = 0;
-    char dir_buf[PATH_MAX];
-    char *directory = realpath(dest, dir_buf);
-    for (int i = 1; i < argc-1; i++) {
-        strncpy(buff, argv[i], BUFFSIZE-1);
-        source = basename(buff);
-        char newname[PATH_MAX];
-        snprintf(newname, PATH_MAX, "%s/%s", directory, source);
-        if (copyat(AT_FDCWD, argv[i], AT_FDCWD, newname) < 0) {
-            if (fstatat(AT_FDCWD, argv[i], &st, AT_SYMLINK_NOFOLLOW) == -1) {
-                snprintf(buff, BUFFSIZE, "%s: cannot stat (source) '%s'", argv[0], argv[i]);
-                perror(buff);
-                err++;
-            } else if (fstatat(AT_FDCWD, dest, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-                snprintf(buff, BUFFSIZE, "%s: cannot stat (dest) '%s'", argv[0], dest);
-                perror(buff);
-                err++;		
-            } else {    // access problem? permision denied?
-                snprintf(buff, BUFFSIZE, "%s: cannot copy '%s' to '%s'", argv[0], argv[i], dest);
-                perror(buff);
-                err++;
-            }
-        }
-    }
-    return err; 
+    printf("Realpath of '%s' -> '%s'\n", input, output);
+    return 0;
 }
-
-static int main_dd(int argc, char *argv[])
-{
-    if (argc < 3) {
-        printf("Usage: %s if=<input file> of=<output file> [count=<num item>] [bs=<tam item>]\n",argv[0]);
-        return -1;
-    }
-    char *comm = *argv++;
-    char *ifname = NULL, *ofname = NULL;
-    unsigned long bs = 512;
-    unsigned long count = 0;
-    ssize_t nbytes = -1; //the entire file, until EOF (rlen == 0)
-    while (*argv) {
-        if ((argv[0][0]=='i')&&(argv[0][1]=='f')&&(argv[0][2]=='=')) {
-            ifname = &argv[0][3];
-        } else if ((argv[0][0]=='o')&&(argv[0][1]=='f')&&(argv[0][2]=='=')) {
-            ofname = &argv[0][3];
-        } else if ((argv[0][0]=='b')&&(argv[0][1]=='s')&&(argv[0][2]=='=')) {
-            bs = atol(&argv[0][3]);
-        } else if (strncmp(argv[0],"count=",6)==0) {
-            count = atol(&argv[0][6]);
-        } else {
-            fprintf(stderr,"Invalid argument: '%s'\n",argv[0]);
-        }
-        argv++;
-    }
-    if (!ifname || !*ifname) {
-        fprintf(stderr, "Missing input file\n");
-        return -1;
-    }
-    if (!ofname || !*ofname) {
-        fprintf(stderr, "Missing output file\n");
-        return -1;
-    }
-    if (bs == 0) {
-        fprintf(stderr, "Invalid value for bs\n");
-        return -1;
-    }
-    if (count) {
-        nbytes = bs * count;
-    }
-
-    int ret = 0;
-    char errbuff[256];
-    int fdi = open(ifname, O_RDONLY);
-    if (fdi == -1) {
-        snprintf(errbuff, 256, "%s: open: %s", comm, ifname);
-        ret = -1;
-    }
-    int fdo = open(ofname, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (fdo == -1) {
-        snprintf(errbuff, 256, "%s: open: %s", comm, ofname);
-        ret = -1;
-    }
-    ssize_t rlen = 0, acc = 0;
-    while (ret != -1 && (nbytes == -1 || nbytes > acc)) {
-        char buf[bs];
-        if ((rlen = read(fdi, buf, bs)) <= 0) break;
-        ssize_t off = 0;
-        do {
-            if ((ret = write(fdo, buf + off, rlen - off)) < 0) break;
-            off += ret;
-        } while (off < rlen);
-        acc += off;
-    }
-    if (ret == -1) {
-        snprintf(errbuff, 256, "%s: write", comm);
-    }
-    if (rlen == -1) {
-        snprintf(errbuff, 256, "%s: read", comm);
-        ret = -1;
-    }
-    if (ret != -1) fprintf(stdout, "Transferred %ld\n", acc);
-    else perror(errbuff);
-
-    if (fdi != -1) close(fdi);
-    if (fdo != -1) close(fdo);
-    return ret;
-}
-
-// To test renameat
-static int main_renameat(int argc, char *argv[])
-{
-    if (argc < 4) {
-         printf("Rename files at directories opened with opendir\n");
-         printf("Usage: %s olddirfd oldpathname newdirfd newpathname\n", argv[0]);
-         printf("       AT_FDCWD=%d\n", AT_FDCWD);
-         return 1;
-    }
-    int olddirfd = atoi(argv[1]), newdirfd = atoi(argv[3]);
-    char *oldpathname = argv[2], *newpathname = argv[4];
-    int ret = renameat(olddirfd, oldpathname, newdirfd, newpathname);
-    if (ret == -1){
-        perror("renameat");
-        fprintf(stderr, "Renaming '%s' @ dirfd=%d -> '%s' @ dirfd=%d FAILED!\n", oldpathname, olddirfd, newpathname, newdirfd);
-    } else {
-        fprintf(stderr, "OK Renaming '%s' @ dirfd=%d -> '%s' @ dirfd=%d\n", oldpathname, olddirfd, newpathname, newdirfd);
-    }
-    return ret;
-}
-
-
-static int main_rmdir(int argc, char *argv[]) {
-    int status = 0;
-    for (int i = 1; i < argc; i++){
-        char *dirname = argv[i];
-        int ret = rmdir(dirname);
-        if (ret < 0){
-            perror("rmdir");
-            fprintf(stderr, "Removing directory '%s' FAILED!\n", dirname);
-            status |= ret;
-        }
-    }
-    return status;
-}
-
 
 // Touch a regular file
-static int main_touch_open(int argc, char *argv[])
+static int main_touch(int argc, char *argv[])
 {
     int status = 0;
     for (int i = 1; i < argc; i++){
-        int fd = open(argv[i], O_WRONLY | O_CREAT | O_APPEND, 0666);
+        int fd = open(argv[i], O_CREAT|O_WRONLY, 0666);
         if (fd < 0){
             perror("open");
             printf("Touching file '%s' FAILED!\n", argv[i]);
             status++;
-        } else {
-            close(fd);
         }
+        close(fd);
     }
     return status;
 }
 
-// Touch a regular file (fopen version)
-// static int main_touch_fopen(int argc, char *argv[])
-// {
-//     int status = 0;
-//     for (int i = 1; i < argc; i++){
-//         FILE *fd = fopen(argv[i], "a");
-//         if (!fd){
-//             perror("open");
-//             printf("Touching file '%s' FAILED!\n", argv[i]);
-//             status++;
-//         } else {
-//             fclose(fd);
-//         }
-//     }
-//     return status;
-// }
 
-#define main_touch(a,b) main_touch_open(a,b)
+#define WC_INDEX_C 0
+#define WC_INDEX_W 1
+#define WC_INDEX_L 2
+#define WC_SHOW_C (0x1 << WC_INDEX_C)
+#define WC_SHOW_W (0x1 << WC_INDEX_W)
+#define WC_SHOW_L (0x1 << WC_INDEX_L)
+static int count_wc(int fileno, unsigned long *count)
+{
+    char buff[BUFSIZ];
+    int stw = 0;
+    ssize_t len;
+    do {
+        len = read(fileno, buff, BUFSIZ);
+        if (len == -1) return -1;
+        count[WC_INDEX_C] += len;
+        for (int i = 0; i < len; i++) {
+            if (buff[i] == '\n') count[WC_INDEX_L] += 1;
+            if (buff[i] != ' ' && buff[i] != '\t' && buff[i] != '\n') {
+               if (!stw) count[WC_INDEX_W] += 1;
+               stw = 1;
+            } else {
+               stw = 0;
+            } 
+        }
+    } while(len);
+    return 0;
+}
+
+static void print_wc(int show, unsigned long *count, char *name)
+{
+    if (!show || (show & WC_SHOW_L)) printf("%7ld ", count[WC_INDEX_L]);
+    if (!show || (show & WC_SHOW_W)) printf("%7ld ", count[WC_INDEX_W]);
+    if (!show || (show & WC_SHOW_C)) printf("%7ld ", count[WC_INDEX_C]);
+    puts(name?:"");
+}
+
+static int main_wc(int argc, char *argv[])
+{
+    unsigned long count[3];
+    int show = 0;
+    int res = 0;
+    char *cmd = *argv++;
+    argc--;
+    while (argc) {
+        if (strcmp(*argv, "-c") == 0)       show |= WC_SHOW_C;
+        else if (strcmp(*argv, "-w") == 0)  show |= WC_SHOW_W;
+        else if (strcmp(*argv, "-l") == 0)  show |= WC_SHOW_L;
+        else break;
+        argc--;
+        argv++;
+    }
+    count[WC_INDEX_C] = 0;
+    count[WC_INDEX_W] = 0;
+    count[WC_INDEX_L] = 0;
+    if (!argc) {
+        res = count_wc(STDIN_FILENO, count);
+        print_wc(show, count, NULL);
+    } else {
+        while (*argv) {
+            char *name = *argv++;
+            int fd = open(name, O_RDONLY);
+            if (fd == -1) {
+                char buff[256];
+                snprintf(buff, 256, "%s: open: %s", cmd, name);
+                perror(buff);
+                res++;
+                continue;
+            }
+            unsigned long c[3];
+            c[WC_INDEX_C] = 0;
+            c[WC_INDEX_W] = 0;
+            c[WC_INDEX_L] = 0;
+            res += count_wc(fd, c);
+            print_wc(show, c, name);
+            close(fd);
+            count[WC_INDEX_C] += c[WC_INDEX_C];
+            count[WC_INDEX_W] += c[WC_INDEX_W];
+            count[WC_INDEX_L] += c[WC_INDEX_L];
+        }
+        if (argc > 1) print_wc(show, count, "total");
+    }
+    return res;
+}
 
 // Open a file
-static void print_open_flags(){
-    printf("Flags:\t O_RDONLY=%#x O_WRONLY=%#x O_RDWR=%#x \n"
-              "\t O_CREAT=%#x O_EXCL=%#x\n"
-              "\t O_TRUNC=%#x O_APPEND=%#x\n"
-              "\t O_DIRECTORY=%#x O_NOFOLLOW=%#x\n"
-              "\t O_TMPFILE=%#x\n",
-                O_RDONLY, O_WRONLY, O_RDWR,
-                O_CREAT, O_EXCL,
-                O_TRUNC, O_APPEND,
-                O_DIRECTORY, O_NOFOLLOW,
-                O_TMPFILE);
+static void open_usage_common()
+{
+    fprintf(stderr, "\tflags in hexa\n\tmode in octal (rwxrwxrwx)\n");
+    fprintf(stderr, "\t\tflags -> %#1x: O_RDONLY, %#1x: O_WRONLY, %#1x: O_RDWR\n", O_RDONLY,O_WRONLY,O_RDWR);
+    fprintf(stderr, "\t\tflags -> %#10x: O_APPEND | flags\n", O_APPEND);
+    fprintf(stderr, "\t\tflags -> %#10x: O_TRUNC | flags\n", O_TRUNC);
+    fprintf(stderr, "\t\tflags -> %#10x: O_CREAT | flags\n", O_CREAT);
+    fprintf(stderr, "\t\tflags -> %#10x: O_EXCL | flags\n", O_EXCL);
+    fprintf(stderr, "\t\tflags -> %#10x: O_NOFOLLOW | flags\n", O_NOFOLLOW);
+    fprintf(stderr, "\t\tflags -> %#10x: O_DIRECTORY | flags\n", O_DIRECTORY);
+    fprintf(stderr, "\t\tflags -> %#10x: O_TMPFILE | flags\n", O_TMPFILE);
+    fprintf(stderr, "\t\tflags -> %#10x: O_PATH | flags\n", O_PATH);
 }
+
 static int main_open(int argc, char *argv[])
 {
-    if (argc < 2) {
-         printf("Usage:%s filename [or-ed hex flags: 0x...]\n", argv[0]);
-         print_open_flags();
-         return 1;
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s pathname flags\n", argv[0]);
+        fprintf(stderr, "Usage: %s pathname flags mode\n", argv[0]);
+        open_usage_common();
+        return 1;
     }
     char *pathname = argv[1];
-    int flags = 0;
-    if (!argv[2]){
-        flags = O_RDWR;
+    int flags = (int)strtol(argv[2], NULL, 16);
+    mode_t mode = 0;
+    int fid;
+    if ((flags & O_CREAT) || ((flags & O_TMPFILE)==O_TMPFILE)) {
+        if (argc < 4) {
+            fprintf(stderr, "open: missing mode with flag O_CREAT or O_TMPFILE(%#x)\n", flags);
+            open_usage_common();
+            return -1;
+        }
+        mode = (int)strtol(argv[3], NULL, 8);
+        fid = open(pathname, flags, mode);
     } else {
-        flags = strtol(argv[2], NULL, 16);
+        fid = open(pathname, flags);
     }
-    int fid = open(pathname, flags, 0777);
     if (-1 != fid){
-        printf("File '%s' opened fid=%d (flags=%#x)\n", pathname, fid, flags);
-        char ans[33];
-        sprintf(ans, "%i", fid);
-        setenv("ans", ans, 1);
+        printf("File '%s' opened fid=%d with flags=%#x [mode=%#o]\n", pathname, fid, flags, mode);
     } else {
         perror("open");
-        printf("Opening file or dir '%s' FAILED!\n", pathname);
+        printf("Failed openenig file '%s' with flags %#x [mode=%#o]\n", pathname, flags, mode);
         return -1;
     }
     return 0;
 }
 
-// Open a file in a directory open with opendir
 static int main_openat(int argc, char *argv[])
 {
-    if (argc < 3) {
-         printf("Open a file at a directory open with opendir\n");
-         printf("Usage: %s dirfd filename\n", argv[0]);
-         return 1;
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s dirfd pathname flags\n", argv[0]);
+        fprintf(stderr, "Usage: %s dirfd pathname flags mode\n", argv[0]);
+        fprintf(stderr, "\t\tdirfd -> %d: AT_FDCWD | flags\n", AT_FDCWD);
+        open_usage_common();
+        return 1;
     }
     int dirfd = atoi(argv[1]);
     char *pathname = argv[2];
-    int fid = openat(dirfd, pathname, O_RDWR);
-    if (-1 != fid){
-        printf("File '%s' @ dirfd=%d opened fid=%d\n", pathname, dirfd, fid);
-        char ans[33];
-        sprintf(ans, "%i", fid);
-        setenv("ans", ans, 1);
+    int flags = (int)strtol(argv[3], NULL, 16);
+    mode_t mode = 0;
+    int fid;
+    if ((flags & O_CREAT) || ((flags & O_TMPFILE)==O_TMPFILE)) {
+        if (argc < 5) {
+            fprintf(stderr, "open: missing mode with flag O_CREAT or O_TMPFILE(%#x)\n", flags);
+            open_usage_common();
+            return -1;
+        }
+        mode = (int)strtol(argv[4], NULL, 8);
+        fid = openat(dirfd, pathname, flags, mode);
     } else {
-        printf("Opening regular file '%s' @ dirfd=%d FAILED!\n", pathname, dirfd);
+        fid = openat(dirfd, pathname, flags);
+    }
+    if (-1 != fid){
+        printf("File '%s' opened fid=%d with flags=%#x [mode=%#o]\n", pathname, fid, flags, mode);
+    } else {
         perror("openat");
+        printf("Failed openenig file '%s' in flags %#x [mode=%#o]\n", pathname, flags, mode);
         return -1;
     }
     return 0;
 }
-
 
 // Close an open file
 static int main_close(int argc, char *argv[])
 {
     if (argc < 2) {
-         printf("Usage: %s <fileno>\n", argv[0]);
+         fprintf(stderr, "Usage: %s <fileno>\n", argv[0]);
          return 1;
     }
     int fid = atoi(argv[1]);
@@ -1287,127 +3396,328 @@ static int main_close(int argc, char *argv[])
     return 0;
 }
 
-// Open a directory
-static int main_opendir(int argc, char *argv[])
+static int main_glob(int argc, char *argv[])
 {
-    if (argc < 2) {
-         printf("Usage: %s dirname\n", argv[0]);
-         return 1;
-    }
-    char *pathname = argv[1];
-    DIR *d = opendir(pathname);
-    if (d){
-        printf("Directory '%s' opened fid=%d\n", pathname, dirfd(d));
-        char ans[33];
-        sprintf(ans, "%i", dirfd(d));
-        setenv("ans", ans, 1);
-    } else {
-        printf("Opening dir '%s' FAILED!\n", pathname);
-        perror("opendir");
+// int glob(const char *pattern, int flags,
+//                 int (*errfunc) (const char *epath, int eerrno),
+//                 glob_t *pglob);
+//
+// void globfree(glob_t *pglob);
+//
+// DESCRIPTION
+//        The  glob()  function  searches  for all the pathnames matching
+//        pattern according to the rules used by the shell (see glob(7)).  No
+//        tilde expansion or parameter substitution is done; if you want these,
+//        use wordexp(3).
+//
+//        The globfree() function frees the dynamically allocated storage from
+//        an earlier call to glob().
+//
+//        The results of a glob() call are stored in the structure pointed to
+//        by pglob.  This structure is of type glob_t (declared in <glob.h>)
+//        and includes the  following  elements  defined  by  POSIX.2 (more may
+//        be present as an extension):
+//
+//            typedef struct {
+//                size_t   gl_pathc;    /* Count of paths matched so far  */
+//                char   **gl_pathv;    /* List of matched pathnames.  */
+//                size_t   gl_offs;     /* Slots to reserve in gl_pathv.  */
+//            } glob_t;
+//
+    if (argc <= 1) {
+        fprintf(stderr, "List directories or files using glob wildcards\n");
+        fprintf(stderr, "Usage: %s <glob expression>\n", argv[0]);
         return -1;
     }
+    char *globexpr = argv[1];
+    glob_t globbuf;
+
+    glob(globexpr, GLOB_TILDE|GLOB_BRACE, NULL, &globbuf);
+
+    for (long k=0; k<globbuf.gl_pathc && globbuf.gl_pathv[k]; k++){
+        printf("%s ", globbuf.gl_pathv[k]);
+    }
+    #ifdef __ELF__
+    printf("(%ld %ld)\n", globbuf.gl_pathc, globbuf.gl_offs);
+    #else
+    printf("(%d %d)\n", globbuf.gl_pathc, globbuf.gl_offs);
+    #endif
+
+    globfree(&globbuf);
+
     return 0;
 }
 
 
-// Close an open directory
-static int main_closedir(int argc, char *argv[])
+int main_lsreel(int argc, char *argv[])
 {
-    if (argc < 2) {
-         printf("Usage: %s <fileno>\n", argv[0]);
-         return 1;
+    int rdframefd = open("/dev/framein",  O_RDONLY);
+    if (rdframefd == -1) {
+        perror("open: /dev/framein");
+        return 1;
     }
-    return main_close(argc, argv);
+    long index = 0;
+    long k = 4;
+    for (;;) {
+        //~ short int dim[2];
+        //~ int err = read(rdframefd, dim, 4);
+        short int dim[2 * k];
+        int err = read(rdframefd, dim, 4 * k);
+        if (err == -1) {
+            perror("read: frame dimensions");
+            return 2;
+        }
+        int i;
+        for (i = 0; i < k; i++) {
+            if (!dim[2 * i] || !dim[2 * i + 1]) break;
+            printf("[%ld] %d x %d\n", index++, dim[2 * i], dim[2 * i + 1]);
+        }
+        if (i < k) break;
+    }
+    close(rdframefd);
+    return 0;
 }
 
-static void print_dirent(struct dirent *p, char *dirname) {
+
+#define WIDTHNAME 10
+#define WIDTHFULLNAME 20
+static void print_dirent(int dfd, struct dirent *p)
+{
     if (p){
-        char *type = "n/a", *arrow="";
-        long size = -1;
+        char *name = p->d_name;
+
         struct stat s;
+        int err = fstatat(dfd, name, &s, AT_SYMLINK_NOFOLLOW);
+        if (err == -1){
+            char errbuff[2048];
+            snprintf(errbuff, 2048, "fstatat: '%s'", name);
+            perror(errbuff);
+            return;
+        }
+        mode_t mode = s.st_mode;
+        long size = s.st_size;        
 
-        char fullname[PATH_MAX*2+1], realfullname[PATH_MAX*2];
-        snprintf(fullname, PATH_MAX*2+1, "%s/%s", dirname, p->d_name); fullname[PATH_MAX-1] = '\0';
-        char *rl = realpath(fullname, realfullname);  realfullname[PATH_MAX-1] = '\0';
+        char type[11];
+        int isreg = S_ISREG(mode);
+        int isdir = S_ISDIR(mode);
+        int islnk = S_ISLNK(mode);
+        int ischr = S_ISCHR(mode);
+        int isblk = S_ISBLK(mode);
+        type[0] = islnk?'l':isdir?'d':ischr?'c':isblk?'b':isreg?'-':'?';        
+        type[1]=(mode & S_IRUSR)?'r':'-';
+        type[2]=(mode & S_IWUSR)?'w':'-';
+        type[3]=(mode & S_IXUSR)?'x':'-';
+        type[4]=(mode & S_IRGRP)?'r':'-';
+        //~ type[5]=(mode & S_IWGRP)?'w':'-';
+        //~ type[6]=(mode & S_IXGRP)?'x':'-';
+        //~ type[7]=(mode & S_IROTH)?'r':'-';
+        //~ type[8]=(mode & S_IWOTH)?'w':'-';
+        //~ type[9]=(mode & S_IXOTH)?'x':'-';
+        //~ type[10]='\0';
+        type[4]='\0';
 
-        char linkname[PATH_MAX]; linkname[0]='\0';
-        int serr = lstat(fullname, &s);  // p->d_name is the base name (not the full name)
-
-        if (!serr) {
-            type = S_ISREG(s.st_mode)?" ":S_ISDIR(s.st_mode)?"d":S_ISLNK(s.st_mode)?"l":"?";
-            size = s.st_size;
-            if (S_ISLNK(s.st_mode)){
-                long r = readlink(fullname, linkname, PATH_MAX);
-                linkname[r] = '\0';
-                arrow = (r>0)?"->":"";
+        printf("%#lx\t% 8ld\t%s\t %-*s", p->d_ino, size, type, WIDTHNAME, name);
+        if (islnk) {
+            char buff[PATH_MAX];
+            int len = readlinkat(dfd, name, buff, PATH_MAX-1);
+            if (len >= 0) {
+                    buff[len] = '\0';
+                    printf(" -> %s", buff);
             }
         }
-        char bn[PATH_MAX];
-        strncpy(bn, p->d_name, PATH_MAX); bn[PATH_MAX-1] = '\0'; // basename may alter the buffer
-
-        char nametoprint[PATH_MAX*2+3];
-        sprintf(nametoprint, "%s %s %s", basename(bn), arrow, linkname);
-
-        printf("% 9ld\t% 8ld\t %s \t %-15s %s\n", p->d_ino, size, type, nametoprint, realfullname);
+        printf("\n");
     }
+}
+
+static int main_seekdir(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s DIR loc\n", argv[0]);
+        return 1;
+    }
+    // Open and list a directory
+    DIR *dir = opendir(argv[1]);
+    if (!dir) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: opendir: %s", argv[0], argv[1]);
+        perror(errbuff);
+        return 2;
+    }
+    errno = 0;
+    long pos = strtol(argv[2], NULL, 10);
+    if (errno) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: strtol: %s", argv[0], argv[2]);
+        perror(errbuff);
+        return 3;        
+    }
+
+    /* Scan directory */
+    struct dirent *pdirent;
+    int dfd = dirfd(dir);
+
+    // scanning and printing the directory
+    printf("scanning and printing the directory: %s\n", argv[1]);
+    #if defined(__ivm64__)
+    printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+    #else
+    printf("inode \t\t dirent \t\t %-*s\n",WIDTHNAME,"name");
+    printf("----- \t\t ------ \t\t %-*s\n",WIDTHNAME,"----");
+    #endif    
+    long i = 0;
+    long loc[100];
+    loc[0] = telldir(dir);
+    while ((pdirent = readdir(dir)) != NULL) {
+        i++;
+        print_dirent(dfd, pdirent);            
+        loc[i] = telldir(dir);
+    }
+    #if defined(__ivm64__)
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",20,"----",40,"--------");
+    #else
+    printf("----- \t\t ------ \t\t %-*s\n",20,"----");
+    #endif
+    
+    // seekdir to 'loc' and list the rest of the directory
+    printf("seekdir to %ld and list the rest of the directory\n", pos);
+    #if defined(__ivm64__)
+    printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+    #else
+    printf("inode \t\t dirent \t\t %-*s\n",WIDTHNAME,"name");
+    printf("----- \t\t ------ \t\t %-*s\n",WIDTHNAME,"----");
+    #endif
+    seekdir(dir, loc[pos]);
+    while ((pdirent = readdir(dir)) != NULL) {
+        print_dirent(dfd, pdirent);
+    }
+    #if defined(__ivm64__)
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",20,"----",40,"--------");
+    #else
+    printf("----- \t\t ------ \t\t %-*s\n",20,"----");
+    #endif
+    
+    // using seekdir to list the directory from last to 'loc'
+    printf("using seekdir to list the directory from last to %ld\n", pos);
+    #if defined(__ivm64__)
+    printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+    #else
+    printf("inode \t\t dirent \t\t %-*s\n",WIDTHNAME,"name");
+    printf("----- \t\t ------ \t\t %-*s\n",WIDTHNAME,"----");
+    #endif
+    for (long j = i-1; j >= pos; j--) {
+        seekdir(dir, loc[j]);
+        pdirent = readdir(dir);
+        print_dirent(dfd, pdirent);
+    }
+    #if defined(__ivm64__)
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",20,"----",40,"--------");
+    #else
+    printf("----- \t\t ------ \t\t %-*s\n",20,"----");
+    #endif
+
+
+    if (closedir(dir) == -1) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: closedir: %s (loc=%s)", argv[0], argv[1], argv[2]);
+        perror(errbuff);
+        return 4;
+    }
+
+    return 0;
 }
 
 static int main_ls(int argc, char *argv[])
 {
-    // Open and list a directory
-    char buff[PATH_MAX];
-    char *path=NULL, *canon_path=NULL;
-    DIR *dir;
+    char *cmdname = *argv++;
+    char *dentryname;
+    int isTTY = isatty(STDOUT_FILENO);
+    if (!*argv || !**argv) dentryname = (char *)"."; // Null or empty string
+    else dentryname = *argv++;
 
-    char *d = argv[1];
-    if (!d || !*d) d = "."; // Null or empty string
-
-    // Find canonical name
-    path=d;
-    canon_path = realpath(path, buff);
-    //printf("realpath('%s') -> '%s'\n", path, canon_path);
-
-    // Open the directory
-    dir = opendir(d);
-    if(!dir){
-        printf("Failed opendir '%s'\n", d);
-        if (canon_path) {
-            d = canon_path;
-            printf("Trying its canonicalized form '%s'\n", d);
-            dir = opendir(d);
+    while (dentryname) {
+        DIR *dir = opendir(dentryname);
+        if (!dir) { // file
+            DIR *dot = opendir(".");
+            if (!dot) {
+                char errbuff[256];
+                snprintf(errbuff, 256, "%s: opendir: .", cmdname);
+                perror(errbuff);
+                return 1;
+            }
+            int dfd = dirfd(dot);
+            struct dirent *pdirent;
+            int found = 0;
+            while ((pdirent = readdir(dot)) != NULL) {
+                if (strcmp(pdirent->d_name, dentryname) == 0) {
+                    print_dirent(dfd, pdirent);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) fprintf(stderr, "%s: cannot access '%s': No such file or directory\n", cmdname, dentryname);
+            closedir(dot);
+            dentryname = *argv++;
+            continue;
         }
-    }
-    if (dir) {
-        printf("Dir '%s' is open ", d);
-        printf(" ==> Listing '%s' (realpath='%s')\n", d, canon_path);
 
-        /* Scan directory */
+        // Scan directory
         struct dirent *pdirent;
-        printf("  inode   \t bytes  \ttype  \t name            fullname\n");
-        printf("--------- \t -------\t----- \t -----           -----\n");
-        while ((pdirent = readdir(dir)) != NULL){
-            print_dirent(pdirent, canon_path);
+        #if defined(__ivm64__)
+        printf("%s:\n", dentryname);
+        if (isTTY) printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+        if (isTTY) printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+        #else
+        if (isTTY) printf("inode \t\t dirent \t\t %-*s\n",WIDTHNAME,"name");
+        if (isTTY) printf("----- \t\t ------ \t\t %-*s\n",WIDTHNAME,"----");
+        #endif
+        int dfd = dirfd(dir);
+        while ((pdirent = readdir(dir)) != NULL) {
+            print_dirent(dfd, pdirent);
         }
-        printf("--------- \t -------\t----- \t -----           -----\n");
+        #if defined(__ivm64__)
+        if (isTTY) printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+        #else
+        if (isTTY) printf("----- \t\t ------ \t\t %-*s\n",20,"----");
+        #endif    
 
-        int c = closedir(dir);
-        //printf("c=%d\n\n", c);
-    } else {
-        printf("Failed opendir '%s'\n", d);
+        if (closedir(dir) == -1) {
+            char errbuff[256];
+            snprintf(errbuff, 256, "%s: closedir: %s", cmdname, dentryname);
+            perror(errbuff);
+            return 4;
+        }
+        dentryname = *argv++;
     }
+
     return 0;
 }
+
 
 /* ls using scandir, sort alphabetically */
 static int main_dir(int argc, char *argv[])
 {
-    char *d = argv[1];
+    // Open and list a directory
+    int fd;
+    const char *d = argv[1];
     if (!d || !*d) d = "."; // Null or empty string
 
     // Find canonical name
     char buff[PATH_MAX];
-    char *canon_path=NULL;
-    canon_path = realpath(d, buff);
+    char *canon_path = realpath(d, buff);
+    if (!canon_path) {
+        printf("%s: '%s': No such file or directory\n", argv[0], d);
+        return -1;
+    }
+    if ((fd = open(d, O_RDONLY | O_DIRECTORY)) == -1)
+    {
+        char buff[256];
+        snprintf(buff,256,"%s: open: %s",argv[0],d);
+        perror(buff);
+        return -1;
+    }
 
     /* Scan directory */
     struct dirent **files;
@@ -1418,292 +3728,324 @@ static int main_dir(int argc, char *argv[])
     }
 
     /* Traverse scan */
-    printf("  inode   \t bytes  \ttype  \t name            fullname\n");
-    printf("--------- \t -------\t----- \t -----           -----\n");
+    int isTTY = isatty(STDOUT_FILENO);
+    if (isTTY) printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+    if (isTTY) printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
     for (long k=0; k<nfiles; k++){
-        struct dirent *dd = files[k];
-        print_dirent(dd, canon_path);
-        free(dd);
+        struct dirent *d = files[k];
+        print_dirent(fd, d);
+        free(d);
     }
-    printf("--------- \t -------\t----- \t -----           -----\n");
+    if (isTTY) printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
 
     free(files);
+    close(fd);
     return 0;
 }
 
-static int main_lseek(int argc, char *argv[])
+
+#ifdef FD_SYMLINKS
+static int main_lsof(int argc, char *argv[])
 {
-    if (argc < 4){
-        printf("Usage:\n\t%s fd offset <whence>\n",argv[0]);
-        printf("Whence:\n\tSEEK_SET=%d, SEEK_CUR=%d, SEEK_END=%d\n", SEEK_SET, SEEK_CUR, SEEK_END);
-        return -1;
+    #define DEV_FD "/dev/fd"
+    DIR *dir = opendir(DEV_FD);
+    if (!dir) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: opendir: %s", argv[0], DEV_FD);
+        perror(errbuff);
+        return 1;
+    }
+
+    /* Scan directory */
+    struct dirent *pdirent;
+    int dfd = dirfd(dir);
+    printf("inode \t\t bytes  \ttype  \t %-*s\t %-*s\n",WIDTHNAME,"name",WIDTHFULLNAME,"link");
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+    while ((pdirent = readdir(dir)) != NULL){
+        print_dirent(dfd, pdirent);
+    }
+    printf("----- \t\t -------\t----- \t %-*s\t %-*s\n",WIDTHNAME,"----",WIDTHFULLNAME,"--------");
+
+    if (closedir(dir) == -1) {
+        char errbuff[256];
+        snprintf(errbuff, 256, "%s: closedir: %s", argv[0], DEV_FD);
+        perror(errbuff);
+        return 4;
+    }
+
+    return 0;
+}
+#else
+#define RLIMIT_NOFILE 64*1024
+static int main_lsof(int argc, char *argv[])
+{
+    for (long i=0; i < RLIMIT_NOFILE; i++){
+        int fd = dup(i);
+        if (fd >= 0){
+            struct stat s;
+            if (fstat(fd, &s) == 0) { // no error with fstat
+                printf("fid=%ld", i);
+                long pos = lseek(fd, 0, SEEK_CUR);
+                printf(" inode=%ld size=%ld pos=%ld %s",
+                       s.st_ino, s.st_size, pos,
+                       S_ISREG(s.st_mode)?"REG":S_ISDIR(s.st_mode)?"DIR":S_ISLNK(s.st_mode)?"LNK":S_ISCHR(s.st_mode)?"CHR":S_ISBLK(s.st_mode)?"BLK":"");
+                puts("");
+            }
+            close(fd);
+        } else if (errno != EBADF) {
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
+static int main_ftruncate(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s fildes length \n", argv[0]);
+        return 1;
     }
     int fd = atoi(argv[1]);
-    long offset = atol(argv[2]);
-    int whence = atoi(argv[3]);
-    long newoffset = lseek(fd, offset, whence);
-    if (newoffset != -1) {
-        fprintf(stdout, "new offset=%ld\n", newoffset);
-    } else {
-        perror("lseek");
+    char errbuff[256];
+    errno = 0;
+    off_t offset = strtol(argv[2], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: offset: '%s'", argv[0], argv[2]);
+        perror(errbuff);
         return -1;
     }
+    int res = ftruncate(fd, offset);
+    printf("ftruncate(%d, %ld) = %d\n", fd, offset, res);
+    if (res == -1) {
+        snprintf(errbuff, 256, "%s: ftruncate: '%s'", argv[0], argv[1]);
+        perror(errbuff);
+    }
+    return res;
 }
 
-
-static int main_seekdir(int argc, char *argv[])
+static int main_truncate(int argc, char *argv[])
 {
-    // To test rewindir() and seekdir(),
-    // show the listing but after rewindir + seekdir(loc)
-
-    if (argc != 3){
-        printf("Seekdir: show a directory list starting at a given location\n");
-        printf("Usage: %s dirname loc\n",argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s FILE length\n", argv[0]);
+        return 1;
+    }
+    char errbuff[256];
+    errno = 0;
+    off_t offset = strtol(argv[2], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: offset: '%s'", argv[0], argv[2]);
+        perror(errbuff);
         return -1;
     }
-
-    // Open and list a directory
-    char buff[PATH_MAX];
-    char *path=NULL, *canon_path=NULL;
-    DIR *dir;
-
-    char *d = argv[1];
-    if (!d || !*d) d = "."; // Null or empty string
-
-    long loc = atoi(argv[2]);
-
-    // Find canonical name
-    path=d;
-    canon_path = realpath(path, buff);
-
-    // Open the directory
-    dir = opendir(d);
-    if(!dir){
-        printf("Failed opendir '%s'\n", d);
-        if (canon_path) {
-            d = canon_path;
-            printf("Trying its canonicalized form '%s'\n", d);
-            dir = opendir(d);
-        }
+    
+    int res = truncate(argv[1], offset);
+    printf("truncate('%s', %ld) = %d\n", argv[1], offset, res);
+    if (res == -1) {
+        snprintf(errbuff, 256, "%s: truncate: '%s'", argv[0], argv[1]);
+        perror(errbuff);
     }
-    if (dir) {
-        printf("Dir '%s' is open ", d);
-        printf(" ==> Listing '%s' (realpath='%s')\n", d, canon_path);
-
-        /* Scan directory */
-        struct dirent *pdirent;
-        // Test rewind() / seekdir()
-        printf("Listing after rewinddir() + seekdir(dir, %ld)\n", loc);
-        printf("inode \t bytes  \ttype  \t name            fullname\n");
-        printf("----- \t -------\t----- \t -----           -----\n");
-
-        #define MAXLOC 1024*1024
-
-        long offset[MAXLOC], i=0;
-        offset[0] = telldir(dir);
-        while ((pdirent = readdir(dir)) != NULL){
-            offset[++i] = telldir(dir);
-            if (i>=MAXLOC) break;
-        }
-
-        // Values under 0 -> set 0; over the number of dirs -> max. offset
-        long eoffset = (loc > i )?offset[i]:(loc<0)?offset[0]:offset[loc];
-        //- long eoffset = ((loc>=0)&&(loc<=i))?offset[loc]:loc; // Arbitrary value
-
-        rewinddir(dir);
-        seekdir(dir, eoffset);
-
-        while ((pdirent = readdir(dir)) != NULL){
-            print_dirent(pdirent, canon_path);
-        }
-        printf("----- \t -------\t----- \t -----           -----\n");
-
-        //- // Print all the seen entries, reversely
-        //- for (long k=i; k>=0; k--){
-        //-     seekdir(dir, offset[k]);
-        //-     print_dirent(readdir(dir), canon_path);
-        //- }
-        //- printf("----- \t -------\t----- \t -----           -----\n");
-
-        closedir(dir);
-    } else {
-        printf("Failed opendir '%s'\n", d);
-    }
-    return 0;
+    return res;
 }
 
 
-// Functions stat() or lstat()
+static int main_fchmod(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s mode fildes \n", argv[0]);
+        fprintf(stderr, "\tmode in octal, e.g.: 754, 644\n");
+        return 1;
+    }
+    int fd = atoi(argv[2]);
+    char errbuff[256];
+    errno = 0;
+    mode_t mode = strtol(argv[1], NULL, 8);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: mode: '%s'", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;
+    }
+    int res = fchmod(fd, mode);
+    printf("fchmod(%d, %#o) = %d\n", fd, mode, res);
+    if (res == -1) {
+        snprintf(errbuff, 256, "%s: fchmod: '%s'", argv[0], argv[2]);
+        perror(errbuff);
+    }
+    return res;
+}
+
+static int main_fchmodat(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s dirfd pathname mode flags\n", argv[0]);
+        fprintf(stderr, "\tmode in octal, e.g.: 754, 644\n");
+        fprintf(stderr, "\tUse %d:AT_FDCWD; to refer to current working directory\n",
+                AT_FDCWD);
+        fprintf(stderr, "\tflags in hexa -> %#x:AT_SYMLINK_NOFOLLOW\n", AT_SYMLINK_NOFOLLOW);
+        return -1;
+    }
+    char errbuff[256];
+    errno = 0;
+    int dirfd = strtol(argv[1], NULL, 10);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: dirfd: %s", argv[0], argv[1]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    char *pathname = argv[2];
+    mode_t mode = strtol(argv[3], NULL, 8);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: mode: '%s'", argv[0], argv[3]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    int flags = strtol(argv[4], NULL, 16);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: flags: '%s'", argv[0], argv[4]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    // let's do it
+    int res = fchmodat(dirfd, pathname, mode, flags);
+    printf("fchmodat(%d, '%s', %#o, %#x) = %d\n", dirfd, pathname, mode, flags, res);
+    if (res == -1) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: chmod: '%s'", argv[0], argv[2]);
+        errno = errsv;
+        perror(errbuff);
+    }
+    return res;
+}
+
+static int main_chmod(int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s mode FILE\n", argv[0]);
+        fprintf(stderr, "\tmode in octal, e.g.: 754, 644\n");
+        return 1;
+    }
+    char errbuff[256];
+    errno = 0;
+    mode_t mode = strtol(argv[1], NULL, 8);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: mode: '%s'", argv[0], argv[1]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    
+    int res = chmod(argv[2], mode);
+    printf("chmod('%s', %#o) = %d\n", argv[2], mode, res);
+    if (res == -1) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: chmod: '%s'", argv[0], argv[2]);
+        errno = errsv;
+        perror(errbuff);
+    }
+    return res;
+}
+
 static int main_stat(int argc, char *argv[])
 {
     struct stat st;
+    int (*stat_func)(const char *, struct stat *);
     int res = 0;
     if (argc == 1) {
-        printf("%s: missing operand\n",argv[0]);
-        printf("Usage: stat FILE1  FILE2 ...\n");
-        printf("       lstat FILE1  FILE2 ...\n");
-        printf("       fstat fd1  fd2 ...\n");
+        fprintf(stderr, "Usage: %s [-L] FILE\n",argv[0]);
+        fprintf(stderr, "\t -L follow lins\n");
         return -1;
     }
-    char *cmd = argv[0];
-    argv++;
+    char *progname = *argv++;
+    const char *funcname;
+    if (strcmp(argv[0],"-L") == 0) {
+        stat_func = stat;
+        funcname = "stat";
+        argv++;
+    } else {
+        stat_func = lstat;
+        funcname = "lstat";
+    }
     while (*argv) {
-        int s;
-        if (!strcmp(cmd, "lstat")) {
-            s = lstat(*argv++, &st);
-        }
-        else if (!strcmp(cmd ,"stat")) {
-            s = stat(*argv++, &st);
-        }
-        else if (!strcmp(cmd, "fstat")) {
-            s = fstat(atoi(*argv++), &st);
-        }
-        if (s == 0) {
-            printf("%s: dev=%ld, ino=%ld, mode=%#o, nlink=%ld, uid=%d, gid=%d, rdev=%ld, size=%ld, blksize=%ld, blocks=%ld\n",
-                    cmd, st.st_dev, st.st_ino, st.st_mode, st.st_nlink, st.st_uid, st.st_gid, st.st_rdev, st.st_size,
-                    st.st_blksize, st.st_blocks);
+        char *name = *argv++;
+        if (stat_func(name, &st) == 0) {
+            printf("File: %s\nSize: %ld\tBlocks: %ld\tBlock size: %ld\t%s\nDevice: %ldd\tInode: %#lx\tLinks: %ld\nAccess: %#o\tUid: %d\tGid: %d\tRdev: %ld\n",
+                    name, st.st_size, st.st_blocks, st.st_blksize,
+                    S_ISBLK(st.st_mode)? "block special file":
+                    S_ISCHR(st.st_mode)? "character special file":
+                    S_ISLNK(st.st_mode)? "symbolic link":
+                    S_ISDIR(st.st_mode)? "directory":
+                    S_ISREG(st.st_mode)? "regular file": "unknown",
+                    st.st_dev, st.st_ino, st.st_nlink, st.st_mode & 0777,
+                    st.st_uid,st.st_gid, st.st_rdev);
         } else {
-            perror(cmd);
+            int errsv = errno;
+            char errbuff[256];
+            snprintf(errbuff, 256, "%s: %s: '%s'", progname, funcname, name);
+            errno = errsv;
+            perror(errbuff);
             res = -1;
         }
     }
     return res;
 }
 
-static int bn(char *name)
+static int main_bn(int argc, char *argv[])
 {
-    printf("%s\n", basename(name));
+    printf("%s\n", basename(argv[1]));
     return 0;
 }
 
-static int dn(char *name)
+static int main_dn(int argc, char *argv[])
 {
-    printf("%s\n", dirname(name));
+    printf("%s\n", dirname(argv[1]));
     return 0;
 }
-
-
-//-- // A regular file exists
-//-- static int exist(char *name){
-//--     int fid;
-//--     fid = open(name, O_RDWR);
-//--     if (fid < 0){
-//--         //printf("'%s' NOT found in filesystem\n", name);
-//--         return 0;
-//--     } else {
-//--         //printf("'%s' FOUND in filesystem\n", name);
-//--         close(fid);
-//--         return 1;
-//--     }
-//-- }
 
 static int main_readlink(int argc, char *argv[])
 {
     if (argc == 1) {
-        printf("Usage: %s [-f][-e] FILE\n",argv[0]);
+        fprintf(stderr, "Usage: %s [-f][-e] FILE\n",argv[0]);
         return -1;
     }
     char canon_name[PATH_MAX];
     char *output=canon_name;
-    int res = 0;
+    int res;
     if (strcmp("-f", argv[1]) == 0) {
-        //output = checkpath(argv[2], canon_name);// checkpath no es una "syscall", insertar aqui el code
-        //res = (output == NULL);
+        output = checkpath(argv[2], canon_name);
+        res = (output == NULL);
     } else if (strcmp("-e",argv[1]) == 0) {
         output = realpath(argv[2], canon_name);
         res = (output == NULL);
     } else {
-        res = readlink(argv[1], canon_name, PATH_MAX);
-        if (res < 0) {
-             perror("readlink");
-             output = NULL;
-        }
+        res = readlink(argv[1], canon_name, PATH_MAX-1);
+        canon_name[res] = '\0';
+        if (res < 0) output = NULL;
     }
-    if (output) printf("%s\n",output);
+    if (output) printf("%s\n", output);
     return res;
 }
 
-static int main_readlinkat(int argc, char *argv[])
+int main_argv(int argc, char *argv[])
 {
-    if (argc == 1) {
-        printf("Usage: %s dirfd FILE\n",argv[0]);
-        return -1;
-    }
-    char canon_name[PATH_MAX];
-    char *output=canon_name;
-    int fd = atoi(argv[1]);
-    int res = 0;
-    res = readlinkat(fd, argv[2], canon_name, PATH_MAX);
-    if (res < 0) output = NULL;
-    if (output) printf("%s\n",output);
-    return res;
-}
-
-static int main_dup2(int argc, char *argv[])
-{
-    if (argc < 3) {
-        printf("Usage: %s oldfd newfd [-silent]\n",argv[0]);
-        return -1;
-    }
-    int oldfd = atoi(argv[1]);
-    int newfd = atoi(argv[2]);
-    int res = dup2(oldfd, newfd);
-    if (!(argv[3] && !strncmp(argv[3], "-s", 2))) {
-        // If not -s, be a bit verbose
-        fprintf(stderr, "dup2(%d, %d) = %d\n", oldfd, newfd, res);
-    }
-    return res;
-}
-
-static int main_dup(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Usage: %s oldfd [-silent]\n",argv[0]);
-        return -1;
-    }
-    int oldfd = atoi(argv[1]);
-    int res = dup(oldfd);
-    if (!(argv[2] && !strncmp(argv[2], "-s", 2))) {
-        // If not -s, be a bit verbose
-        fprintf(stderr, "dup(%d) = %d\n", oldfd, res);
-    }
-    return res;
-}
-
-static int usage_realpath(char *comm)
-{
-    //printf("Usage: %s [-e][-m] FILE\n", comm);
-    printf("Usage: %s FILE\n", comm);
-    return -1;
-}
-static int main_realpath(int argc, char *argv[])
-{
-    char *output, *input, buff[PATH_MAX];
-    //~ if (argc == 1) return usage_realpath(argv[0]);
-    //~ if (strcmp(argv[1],"-e")==0) { //all components of the path must exist
-    //~     input = argv[2];
-    //~     if (!input) return usage_realpath(argv[0]);
-    //~     output = realpath(input, buff);
-    //~ } else if (strcmp(argv[1],"-m")==0) { // no path components need exist or be a directory
-    //~     input = argv[2];
-    //~     if (!input) return usage_realpath(argv[0]);
-    //~     output = softpath(input, buff); // esto no es una 'syscall'
-    //~ } else { // all but the last component must exist
-    //~     input = argv[1];
-    //~     output = checkpath(input, buff); // esto no es una 'syscall'
-    //~ }
-    input = argv[1];
-    if (!input) return usage_realpath(argv[0]);
-    output = realpath(input, buff);
-    if (!output) {
-        perror("realpath");
-        return -1;
-    }
-    //printf("Realpath of '%s' -> '%s'\n", input, output);
-    printf("%s\n", output);
+    while (*argv) printf("%s\n",*argv++);
+    COPY(STDIN_FILENO, STDOUT_FILENO);
     return 0;
 }
-
+// A regular file exists
+static int exist(char *name)
+{
+    int fid = open(name, O_RDONLY);
+    if (fid < 0) return 0;
+    close(fid);
+    return 1;
+}
 
 static void print_byte(unsigned char c, size_t size)
 {
@@ -1713,19 +4055,18 @@ static void print_byte(unsigned char c, size_t size)
         printf("\\x%02x", c);
     }
 }
-// A command like cat but simpler, to show regular files
-// It shows non printable chars as hex codes
-static int main_type(int c, char *args[])
+// A command like cat but simpler to show regular files
+static int main_type(int argc, char *argv[])
 {
-    if (!args[1]) {
+    if (argc != 2) {
         printf("Dump a regular file showing hexcodes of non-printable chars\n");
         printf("Usage: type regular_file_name\n");
         return 1;
     } else {
-        args[2]=NULL;
-        FILE *fh = fopen(args[1], "r");
+        argv[2] = NULL;
+        FILE *fh = fopen(argv[1], "r");
         if (!fh) {
-            printf("Error reading regular file '%s'\n", args[1]);
+            printf("Error reading regular file '%s'\n", argv[1]);
             return 2;
         } else {
             long n = 0;
@@ -1735,7 +4076,7 @@ static int main_type(int c, char *args[])
                 n++;
             }
             if (!n) {
-                fprintf(stderr, "Regular file '%s' is empty\n", args[1]);
+                fprintf(stderr, "Regular file '%s' is empty\n", argv[1]);
                 fclose(fh);
                 return 3;
             }
@@ -1746,553 +4087,439 @@ static int main_type(int c, char *args[])
     }
 }
 
-// Write n char to a file, ovewriting it
-static int main_writef(int c, char **args){
-    if (c < 3) {
-        printf("Write chars to a file by its name (-n add a newline at the end)\n");
-        printf("Usage: writef <nbytes> filename\n");
-        printf("       writef string filename\n");
-        printf("       writef string filename -n\n");
+static int main_dup(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "Usage: dup fd\n");
         return 1;
-    } else {
-        long N = atol(args[1]);
-        char *name = args[2];
-        char *A="abcdefghijklmnopqrstuvwxyz~";
-        if (N == 0){
-            A = args[1];
-            N = strlen(args[1]);
-        }
-        int newline = args[3] && !strcmp(args[3], "-n");
-        FILE* fp = fopen(name, "w");
-        if (fp){
-            long lA = strlen(A);
-            for (int i=0; i<N; i++){
-                fprintf(fp, "%c", A[i % lA]);
-            }
-            if (newline)
-                fprintf(fp, "\n");
-            fclose(fp);
-            return 0;
-        } else {
-            perror("fopen");
-            return 2;
-        }
     }
+    int fd = atoi(argv[1]);
+    int res = dup(fd);
+    printf("dup(%d) = %d\n", fd, res);
+    if (res == -1) perror("dup");
+    return 0;
 }
 
-// Write n char to an open file
-static int main_write(int argc, char **args){
+static int main_dup2(int argc, char *argv[])
+{
     if (argc < 3) {
-        printf("Write chars to an open file by its file no.\n");
-        printf("Usage: write fd <nbytes> \n");
-        printf("       write fd string \n");
+        fprintf(stderr, "Usage: dup2 oldfd newfd\n");
         return 1;
-    } else {
-        int fd= atoi(args[1]);
-        long N = atol(args[2]);
-        char *A="abcdefghijklmnopqrstuvwxyz~";
-        // If it is not a number, consider it a string, but string "0" are considered writing 0 bytes
-        if (N == 0 && strcmp(args[2], "0")){
-            A = args[2];
-            N = strlen(args[2]);
-        }
-
-        char *buff = (char*)malloc(sizeof(char)*N+1);
-        buff[0] = '\0';
-        long lA = strlen(A);
-        for (int i=0; i<N; i++){
-            char cb[2];
-            sprintf(cb, "%c", A[i % lA]);
-            strcat(buff, cb);
-        }
-
-        long lw = write(fd, buff, N);
-        free(buff);
-        if (lw!=N){
-            perror("write");
-        }
-        return (N-lw);
     }
+    int oldfd = atoi(argv[1]);
+    int newfd = atoi(argv[2]);
+    int res = dup2(oldfd, newfd);
+    printf("dup2(%d, %d) = %d\n", oldfd, newfd, res);
+    if (res == -1) perror("dup2");
+    return 0;
 }
 
-// Read n char from an open file
-static int main_read(int argc, char **args){
+static int main_linkat(int argc, char *argv[])
+{
+    if (argc < 6) {
+        fprintf(stderr, "Usage: %s olddirfd oldpath newdirfd newpath flags\n", argv[0]);
+        fprintf(stderr, "\tUse %d:AT_FDCWD; to refer to current working directory\n",
+                AT_FDCWD);
+        fprintf(stderr, "\tflags in hexa -> %#x:AT_SYMLINK_NOFOLLOW; %#x:AT_EMPTY_PATH\n",
+                AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH);
+
+        return -1;
+    }
+    char errbuff[256];
+    errno = 0;
+    int olddirfd = strtol(argv[1], NULL, 10);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: olddirfd: %s", argv[0], argv[1]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    char *oldpath = argv[2];
+    int newdirfd = strtol(argv[3], NULL, 10);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: newdirfd: %s", argv[0], argv[3]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    char *newpath = argv[4];
+    int flags = strtol(argv[5], NULL, 16);
+    if (errno) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: newdirfd: %s", argv[0], argv[3]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    flags &= (AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH);
+    
+    int ret = linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+    
+    printf("linkat(%d, '%s', %d, '%s', %#x) = %d\n", olddirfd, oldpath,
+            newdirfd, newpath, flags, ret);
+    if (ret == -1) {
+        int errsv = errno;
+        snprintf(errbuff, 256, "%s: linkat", argv[0]);
+        errno = errsv;
+        perror(errbuff);
+        return -1;
+    }
+    return 0;
+}
+
+static int main_lseek(int argc, char *argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr, "Usage: lseek fildes offset whence\n");
+        fprintf(stderr, "\twhence: 0: SEEK_SET;\t\t1: SEEK_CUR;\t\t2: SEEK_END\n");
+        return 1;
+    }
+    int fd = atoi(argv[1]);
+    long offset = atol(argv[2]);
+    int whence = atoi(argv[3]);
     int ret;
-    if (argc < 3) {
-        printf("Read chars from an open file by its file no.\n");
-        printf("Usage: read fd <nbytes> \n");
-        return 1;
-    } else {
-        int fd = atoi(args[1]);
-        long N = atol(args[2]);
-        char *buff = (char*)malloc(sizeof(char)*N+1);
-        long lr = read(fd, buff, N);
-        if (lr == 0){
-            fprintf(stderr, "EOF\n");
-            ret = 1;
-        } else if (lr < 0){
-            perror("read");
-            ret = -1;
-        } else {
-            buff[lr]='\0';
-            printf("Read %ld bytes: '", lr);
-            for (long k=0; k < lr ; k++){
-                print_byte(buff[k], 1); 
-            }
-            printf("'\n");
-            free(buff);
-            ret = N-lr;
-        }
-        return ret;
+    switch (whence) {
+    case 2: ret = lseek(fd, offset, SEEK_END);
+            printf("lseek(%d, %ld, SEEK_END) = %d\n", fd, offset, ret);
+            break;
+    case 1: ret = lseek(fd, offset, SEEK_CUR);
+            printf("lseek(%d, %ld, SEEK_CUR) = %d\n", fd, offset, ret);
+            break;
+    case 0:
+    default:ret = lseek(fd, offset, SEEK_SET);
+            printf("lseek(%d, %ld, SEEK_SET) = %d\n", fd, offset, ret);
+            break;
     }
-}
-
-
-
-// Truncate a file
-static int main_truncate(int c, char **args){
-    if (c < 3) {
-        printf("Usage: truncate <nbytes> filename\n");
-        return 1;
-    } else {
-        long N = atol(args[1]);
-        char *name = args[2];
-        int t = truncate(name, N);
-        if (t<0) {
-            perror("truncate");
-            return t;
-        }
-    }
-    return 0;
-}
-
-// Truncate an open file
-static int main_ftruncate(int c, char **args){
-    if (c < 3) {
-        printf("Truncate an open file\nUsage: truncate <fd> <nbytes>\n");
-        return 1;
-    } else {
-        long fid = atol(args[1]);
-        long N = atol(args[2]);
-        int t = ftruncate(fid, N);
-        if (t<0) {
-            perror("ftruncate");
-            return t;
-        }
-    }
-    return 0;
-}
-
-static int main_countargs(int argc, char **args){
-    printf("%d\n", argc);
-    return 0;
-}
-
-
-/* recursive du (like du -s) */
-static unsigned long rdu(char *path)
-{
-    if (!path || !*path) return 0; // Null or empty string: do nothing
-
-    char d[PATH_MAX];
-    strcpy(d, path);
-
-    // If path is file or link, the size can be taken directly
-    struct stat s;
-    int serr = lstat(d, &s);  // p->d_name is the base name (not the full name)
-    if (!serr && !S_ISDIR(s.st_mode)) {
-        return s.st_size;
-    }
-
-    // It must be a directory at this point
-
-    // Scan directory
-    struct dirent **files;
-    int nfiles = scandir(d, &files, NULL, alphasort);
-    if (nfiles == -1) {
-        fprintf(stderr, "error scanning '%s'\n", d);
-        perror("scandir");
-        return -1;
-    }
-
-
-    // Save current directory
-    char currwd[PATH_MAX];
-    char *w = getcwd(currwd, PATH_MAX);
-    if (!w) { perror("getcwd"); return -1; }
-
-    // Count size of children recursively
-    unsigned long size = 0;
-    if (chdir(d) == 0) {
-        for (long k=0; k<nfiles; k++){
-            struct dirent *dd = files[k];
-            // Ignore . and .. , to avoid infinite recursion
-            if (strcmp(dd->d_name, ".") && strcmp(dd->d_name, "..")) {
-                unsigned long dsize = rdu(dd->d_name);
-                size += dsize;
-            }
-            free(dd);
-        }
-        if (chdir(w) < 0) return -1;
-    }
-
-    free(files);
-    return size;
-}
-
-#define HUMANSIZE(x) ((double)(((x)>1e12)?((x)/1.0e12):((x)>1e9)?((x)/1.0e9):((x)>1.0e6)?((x)/1.0e6):((x)>1e3)?((x)/1.0e3):(x)))
-#define HUMANPREFIX(x)  (((x)>1e12)?"T":((x)>1e9)?"G":((x)>1e6)?"M":((x)>1e3)?"K":"")
-
-static int main_du(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Total disk usage in bytes of a directory\n");
-        printf("Usage: %s <dir_name> \n",argv[0]);
-        return -1;
-    }
-    unsigned long size = rdu(argv[1]);
-    printf("%ld (%.2f%sB)\n", size, HUMANSIZE(size), HUMANPREFIX(size));
-    return 0;
-}
-
-// Returns the size of the largest memory chunck available.
-// The search start in 2^high (HIGHER_BIT set to 48 in macro) and goes
-// iteratively down making a number of 'steps' refinement
-static unsigned long largest_memory_chunck(int high, int low, int steps, int *exp2)
-{
-    unsigned long base = 0;
-    long incr;
-    void *ptr;
-    int refine = 0;
-    *exp2 = 0;
-    for (incr = (1UL << high); incr >= (1UL << low); incr >>= 1, high--) {
-        ptr = malloc(base + incr);
-        if (ptr) {
-            if (*exp2 == 0) *exp2 = high; 
-            free(ptr);
-            ptr = NULL;
-            base += incr;
-            if (refine++ >= steps) break;
-        }
-    }
-    return base;
-}
-
-static int main_free(int argc, char *argv[])
-{
-    int exp2;
-    unsigned long m = largest_memory_chunck(48, 1, 5, &exp2);
-    printf("Free (max. malloc): %.2f%sB (2^%d)\n", HUMANSIZE(m), HUMANPREFIX(m), exp2);
-    return 0; 
-}
-
-
-static int main_mkstemp(int argc, char *argv[])
-{
-    if (argc != 2) {
-        printf("Usage: %s templateXXXXXX\n",argv[0]);
-        return -1;
-    }
-
-    char *template = strdup(argv[1]);
-    int fd = mkstemp(template);
-    if (fd < 0) {
-        perror("mkstemp");
-    } else {
-        fprintf(stdout, "temporay file '%s' opened as fd=%d\n", template, fd);
-    }
-    free(template);
-
-    return (fd<0);
-}
-
-static int main_mkdtemp(int argc, char *argv[])
-{
-    if (argc != 2) {
-        printf("Usage: %s templateXXXXXX\n",argv[0]);
-        return -1;
-    }
-
-    char *template = strdup(argv[1]);
-    char *t = mkdtemp(template);
-    if (!t) {
-        perror("mkstemp");
-    } else {
-        fprintf(stdout, "temporary directory '%s' created\n", t);
-    }
-    free(template);
-
-    return !t;
-}
-
-// Change permissions
-static int main_chmod(int argc, char *args[]){
-    if (argc < 3) {
-        printf("Usage: chmod <mode(octal)> filename\n");
-        return 1;
-    } else {
-        unsigned int mode;
-        sscanf(args[1], "%o", &mode);
-        int t = chmod(args[2],mode);
-        if (t<0) {
-            perror("chmod");
-            return t;
-        }
-    }
-    return 0;
-}
-
-#define RLIMIT_NOFILE 64*1024
-static int main_lsof(int argc, char *argv[])
-{
-    int newfd = open("/", O_RDONLY | O_DIRECTORY);
-    if (newfd >= 0) close(newfd);
-    else return -1;
-
-    for (long i=0; i<RLIMIT_NOFILE; i++){
-        int fd = dup2(i, newfd);
-        if (fd >= 0){
-            close(fd);
-            struct stat s;
-            int fs = fstat(i, &s);
-            printf("fid=%ld", i);
-            if (!fs) {
-                long pos = lseek(i, 0, SEEK_CUR);
-                printf(" inode=%ld size=%ld pos=%ld %s",
-                       s.st_ino, s.st_size, pos,
-                       S_ISREG(s.st_mode)?"isreg":S_ISDIR(s.st_mode)?"isdir":S_ISLNK(s.st_mode)?"islnk":S_ISCHR(s.st_mode)?"isdev":"");
-            }
-            puts("");
-        }
-    }
-    return 0;
-}
-
-static int main_spawn(int argc, char *argv[])
-{
-    //#ifndef __ivm64__
-	//fprintf(stderr, "ivm_spawn only available for ivm64 architecture\n");
-	//return -1;
-	//#endif
-    if (argc < 2) {
-        printf("Usage: %s <ivm64_binary> [arg1] [arg2] ...\n",argv[0]);
-        return -1;
-    }
-    int ret = 0;
-    #ifdef __ivm64__
-        ret = ivm_spawn(argc-1, &argv[1]);
-    #else
-        pid_t pid = fork();
-        if (pid == 0) {
-            execv(argv[1], &argv[1]);
-            perror("exec");
-            exit(-1);
-        } else if (pid>0) {
-            int wstatus;
-            wait(&wstatus);
-            ret = WEXITSTATUS(wstatus);
-        } else{
-            fprintf(stderr, "fork failed!\n");
-        }
-    #endif
-    //fprintf(stderr, "spawn returned %d\n", ret);
+    if (ret == -1) perror("lseek");
     return ret;
 }
 
-static int main_source(int argc, char *argv[])
+
+static int main_umask(int argc, char *argv[])
 {
-    if (argc < 2) {
-        printf("Usage: %s <shell_script>\n",argv[0]);
-        printf("       note: arguments are not supported for now\n");
-        return -1;
-    }
-
-    // This source command does not accept input redirections like 'source script < file'
-    if (stdin_0 >= 0) {
-        fprintf(stderr, "The source command does not accept input redirection\n");
-        return 1;
-    }
-
-    // Save current stdout, stderr of the shell, in case the source command has
-    // output redirection, in this case we will redirect in the preamble in
-    // such a way all the script get redirected too (to run things like 'source
-    // script.sh > output.txt'
-    int shell_stdout_fileno0 = dup(stdout_0);
-    int shell_stderr_fileno0 = dup(stderr_0);
-    int source_stdout_fileno0 = dup(STDOUT_FILENO);
-    int source_stderr_fileno0 = dup(STDERR_FILENO);
-
-    //printk("[%s] stdout_0=%d shell_stdout_fileno0=%d\n", __func__, stdout_0, shell_stdout_fileno0); // Debug
-
-    // Save current stdin
-    int stdin_fileno0 = dup(STDIN_FILENO);
-    int tmpfd = -1;
-    if (stdin_fileno0 >= 0) {
-        // Make a tmp copy of the script, in order to add a preamble to prepare
-        // things, and an epilogue to restore STDIN_FILENO and close temporary
-        // files
-        mkdir("/tmp", 0777);
-        tmpfd = open("/tmp/", O_TMPFILE | O_RDWR, 0777);
-        //tmpfd = open("/tmp/_source_script_tmp", O_CREAT | O_TRUNC | O_RDWR, 0777); // Debug
-        if (tmpfd >= 0) {
-            lseek(tmpfd, 0, SEEK_SET);
-            int fd = open(argv[1], 0x0);
-            if (fd >= 0) {
-                char buff[MAX_LINE];
-                // Script preamble
-                sprintf(buff, "# preamble ===========\n"
-                              "dup2 %d 1 -silent \n"
-                              "dup2 %d 2 -s \n"
-                              //"lsof; echo end preamble----- \n"
-                              "#=====================\n",
-                               source_stdout_fileno0, source_stderr_fileno0);
-                int nw = write(tmpfd, buff, strlen(buff));
-                // Copy the script to the temporary file
-                COPY(fd, tmpfd);
-                close(fd);
-                // Append to the end a dup2 to restore the stdin to the copy of
-                // the script
-                lseek(tmpfd, 0, SEEK_END);
-                // Script epilogue
-                // All the (sub)commands of the epilogue must be in the same
-                // line separated by semicolons, because once STDIN_FILENO is
-                // restored (dup2), no more reads are possible from the copy of
-                // the script
-                sprintf(buff, "\n# epilogue ===========\n"
-                              //"echo begin_epilogue -----; lsof \n"
-                              "dup2 %d 0 -s ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "dup2 %d 1 -s ;"
-                              "dup2 %d 2 -s ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "close %d  > /tmp/null 2> /tmp/null ;"
-                              "rm /tmp/null ;"
-                              "\n",
-                              stdin_fileno0,
-                              stdin_fileno0, tmpfd,
-                              shell_stdout_fileno0, shell_stderr_fileno0,
-                              shell_stdout_fileno0, shell_stderr_fileno0,
-                              source_stdout_fileno0, source_stderr_fileno0
-                              );
-                nw = write(tmpfd, buff, strlen(buff));
-                // Do tmpfd->stdin, and the script will get executed automagically
-                // Notice as from this point, we are not in a tty, there is no
-                // prompt while executing source
-                lseek(tmpfd, 0, SEEK_SET); //rewind after writing
-                // This redirection does the magic for executing the script
-                int res = dup2(tmpfd, STDIN_FILENO);
-                if (res < 0) {
-                    // If fails, restore all stuff like in the epilogue
-                    fprintf(stderr, "Running script '%s' failed\n", argv[1]);
-                    goto error;
-                }
-            } else {
-                // Only close tmpfd if open() fails; otherwise the closing of this file
-                // is done by the epilogue
-                fprintf(stderr, "Opening '%s' failed\n", argv[1]);
-                goto error;
-            }
+    int mask = umask(0);    //query umask an set to 0
+    umask(mask);            //restore umask
+    int symbolic = 0;
+    int change = 0;
+    argv++;
+    argc--;
+    if (argc) {
+        if (strcmp(*argv,"-S") == 0) {
+            symbolic = 1;
+            argc--;
+            argv++;
         } else {
-            fprintf(stderr, "Opening tmp file failed\n");
-            goto error;
+            if (change == 1) {
+                fprintf(stderr,"umask: too many arguments\n");
+                return 1;
+            }
+            change = 1;
+            errno = 0;
+            mask = strtol(*argv, NULL, 8);
+            if (errno) {
+                fprintf(stderr,"umask: bad symbolic mode operator: %s\n", *argv);
+                return 1;
+            }
         }
     }
-    return 0;
+    if (change) {
+        umask(mask);
+    }else if (symbolic) {
+        char buf[20];
+        int i = 0;
+        mode_t nmask = ~mask;
+        buf[i++] = 'u';   buf[i++] = '=';
+        if (nmask & 0400) buf[i++] = 'r';
+        if (nmask & 0200) buf[i++] = 'w';
+        if (nmask & 0100) buf[i++] = 'x';
+        buf[i++] = ',';
+        buf[i++] = 'g';   buf[i++] = '=';
+        if (nmask & 0040) buf[i++] = 'r';
+        if (nmask & 0020) buf[i++] = 'w';
+        if (nmask & 0010) buf[i++] = 'x';
+        buf[i++] = ',';
+        buf[i++] = 'o';   buf[i++] = '=';
+        if (nmask & 0004) buf[i++] = 'r';
+        if (nmask & 0002) buf[i++] = 'w';
+        if (nmask & 0001) buf[i++] = 'x';
+        buf[i++] = '\0';
+        puts(buf);
+    } else {
+        printf("%#o\n", mask);
+    }
 
-    error:
-        // If fails, close all stuff like in the epilogue
-        if (tmpfd >= 0) close(tmpfd);
-        close(stdin_fileno0);
-        close(shell_stdout_fileno0);
-        close(shell_stderr_fileno0);
-        close(source_stdout_fileno0);
-        close(source_stderr_fileno0);
-        return -1;
+    return 0;
 }
 
-// Support for implementing heredoc redirection (" << TOKEN"): read from stdin
-// until a line with only "TOKEN" is found, write it to a temporary file; if
-// everything is ok return the descriptor to the open temporary file;
-// otherwise return -1 
-static int heredoc_open(char* token)
+
+// snprintf -> return negative if error
+#define SNPRINTF1(item, size, format, val)\
+    ({\
+        ssize_t ret = snprintf(item, size, format, val);\
+        if (ret < 0) return -3;\
+        ret;\
+    })
+
+static int read_writehexa(int fdi, int fdo, off_t start, ssize_t nbytes)
 {
-    mkdir("/tmp", 0777);
-    int tmpfd = open("/tmp/", O_TMPFILE | O_RDWR, 0777);
-    int hderror = 0;
-    if (tmpfd >= 0) {
-        char *lineptr = NULL;
-        ssize_t n = 0, nr, nw;
-        long endlen = strlen(token);
-        while ( (nr = getline(&lineptr, &n, stdin)) > 0) {
-            // Do not check final EOL 
-            int end = !strncmp(token, lineptr, endlen)
-                && ('\0' == lineptr[endlen] || '\n' == lineptr[endlen]);
-            if (end) {
-                free(lineptr);
-                break;}
-            else {
-                nw = write(tmpfd, lineptr, nr);
-                if (nw != nr) {hderror = 1; break;}
-                free(lineptr);
-                lineptr=NULL; n=0;   // Prepare next getline
+    #define LINE_SIZE 16
+    unsigned char buf1[LINE_SIZE];
+    unsigned char buf2[LINE_SIZE];
+    unsigned char *p1 = buf1;
+    unsigned char *p2 = buf2;
+    int markdiff = 0;
+    *p1 = '+';
+    *p2 = '-';
+    unsigned long acc = 0;
+
+    while (nbytes) {
+        ssize_t rlen;
+        long off = 0;
+        do {
+            rlen = READ(fdi, p1 + off, MIN(LINE_SIZE, nbytes) - off);
+            if (rlen == 0) break;
+            off += rlen;
+        } while (off < LINE_SIZE);
+        acc += off;
+        nbytes -= off;
+
+        if (memcmp(p1, p2, off) == 0 && off == LINE_SIZE) {
+            if (!markdiff) WRITE(fdo, "...\n", 4);
+            markdiff = 1;
+            continue;
+        }
+        markdiff = 0;
+        #define ITEM_SIZE 16
+        char item[ITEM_SIZE];
+        ssize_t wlen;
+        wlen = SNPRINTF1(item, ITEM_SIZE, "%#010lx ", start + acc - off);
+        if (wlen > 0) WRITE(fdo, item, wlen);
+
+        for (int j = 0; j < off; j++) {
+            if (p1[j]) {
+                wlen = SNPRINTF1(item, ITEM_SIZE, "%#04x ", p1[j]);
+                if (wlen > 0) WRITE(fdo, item, wlen);
+            } else {
+                WRITE(fdo, "0x00 ", 5);
             }
         }
-        //fflush(stdin); // getline() may have read chars in advance letting them in the buffer
-        lseek(tmpfd, 0, SEEK_SET);
-        if (!hderror) return tmpfd;
-        else {
-            close(tmpfd);
+        for (int k = off; k < LINE_SIZE; k++) WRITE(fdo, " .   ", 5);
+        for (int k = 0; k < off; k++) {
+            wlen = SNPRINTF1(item, ITEM_SIZE, "%c", (isprint((int)p1[k]))?p1[k]:'.');
+            if (wlen > 0) WRITE(fdo, item, wlen);
+        }
+        WRITE(fdo, "\n", 1);
+
+        if (rlen == 0) break;   // no more to process
+        SWAP(p1, p2);
+    }
+
+    return 0;
+}
+
+
+static int main_read(int argc, char *argv[])
+{
+     if (argc < 3) {
+        fprintf(stderr, "Usage: read fildes <nbytes> [0:stdout; 1:stderr]\n");
+        return 1;
+    }
+    errno = 0;
+    char errbuff[256];    
+    int fdi = strtol(argv[1], NULL, 10);
+    int fdo = STDOUT_FILENO;
+    if (errno) {
+        snprintf(errbuff, 256, "%s: fildes '%s'", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;
+    }
+    errno = 0;
+    ssize_t nbytes = strtol(argv[2], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: nbytes '%s'", argv[0], argv[2]);
+        perror(errbuff);
+        return -1;
+    }
+    if (nbytes == 0) return 0;
+
+    if (argc == 4 && isatty(STDOUT_FILENO) && atoi(argv[3])) {
+        fdo = STDERR_FILENO;
+    }
+    
+    //~ off_t start = lseek(fdi, 0, SEEK_CUR);
+    //~ if (start == -1) {
+        //~ snprintf(errbuff, 256, "%s: lseek fd=%d", argv[0], fdi);
+        //~ perror(errbuff);
+        //~ return -1;
+    //~ }
+    //~ int ret = read_writehexa(fdi, fdo, start, nbytes);
+    int ret = read_writehexa(fdi, fdo, 0, nbytes);
+    if (ret == -1) {
+        snprintf(errbuff, 256, "%s: read fd=%d", argv[0], fdi);
+    } else if (ret == -2) {
+        snprintf(errbuff, 256, "%s: write fd=%d", argv[0], fdo);
+    } else if (ret == -3) {
+        snprintf(errbuff, 256, "%s: snprintf", argv[0]);
+    }
+
+    if (ret) perror(errbuff);
+    return ret;
+}
+
+
+static int main_hexdump(int argc, char *argv[])
+{
+     if (argc < 3) {
+        fprintf(stderr, "Usage: %s file <nbytes> [start] [0:stderr; 1:stdout]\n", argv[0]);
+        return 1;
+    }
+    errno = 0;
+    char errbuff[256];
+    int fdi = open(argv[1], O_RDONLY);
+    if (fdi == -1) {
+        snprintf(errbuff, 256, "%s: open '%s'", argv[0], argv[1]);
+        perror(errbuff);
+        return -1;       
+    }
+    int fdo = STDOUT_FILENO;
+    errno = 0;
+    ssize_t nbytes = strtol(argv[2], NULL, 10);
+    if (errno) {
+        snprintf(errbuff, 256, "%s: nbytes '%s'", argv[0], argv[2]);
+        perror(errbuff);
+        return -1;
+    }
+    if (nbytes == 0) return 0;
+    ssize_t start = 0;
+    if (argc > 3) {
+        start = strtol(argv[3], NULL, 10);
+        if (errno) {
+            snprintf(errbuff, 256, "%s: start '%s'", argv[0], argv[3]);
+            perror(errbuff);
+            return -1;
+        }        
+        off_t seekstart = lseek(fdi, start, SEEK_SET);
+        if (seekstart != start) {
+            snprintf(errbuff, 256, "%s: lseek: %ld", argv[0], seekstart);
+            perror(errbuff);
             return -1;
         }
     }
-    return -1;
+    if (argc > 4) {
+        fdo = atoi(argv[4]);
+        if (fdo != STDOUT_FILENO) fdo = STDERR_FILENO;
+    }
+
+    int ret = read_writehexa(fdi, fdo, start, nbytes);
+    if (ret == -1) {
+        snprintf(errbuff, 256, "%s: read fd=%d", argv[0], fdi);
+    } else if (ret == -2) {
+        snprintf(errbuff, 256, "%s: write fd=%d", argv[0], fdo);
+    } else if (ret == -3) {
+        snprintf(errbuff, 256, "%s: snprintf", argv[0]);
+    }
+    close(fdi);
+
+    if (ret) perror(errbuff);
+    return ret;
+}
+
+
+// Write n char to a file, ovewriting it
+static int populate(int fd, ssize_t count)
+{
+    const char *A="abcdefghijklmnopqrstuvwxyz~";
+    int Alen = strlen(A);
+    ssize_t left = count;
+    while (left) {
+        ssize_t len = write(fd, A, MIN(left, Alen));
+        if (len == -1) return -1;
+        left -= len;
+    }
+    return 0;
+}
+
+static int main_write(int argc, char *argv[])
+{
+     if (argc < 3) {
+        fprintf(stderr, "Usage: write fildes <nbytes>\n");
+        return 1;
+    }
+    int fd = atoi(argv[1]);
+    ssize_t count = atol(argv[2]);
+    if (populate(fd, count)) {
+        char buff[256];
+        snprintf(buff, 256, "%s: write", argv[0]);
+        perror(buff);
+        return -1;
+    }
+    return 0;
+}
+
+static int writechars(int c, char **args)
+{
+    if (c < 3) {
+        fprintf(stderr, "Usage: writechars <nbytes> filename\n");
+        return 1;
+    }
+
+    long N = atol(args[1]);
+    char *name = args[2];
+    int fd = open(name, O_CREAT|O_WRONLY, 0777);
+    if (fd){
+        populate(fd, N);
+        close(fd);
+        return 0;
+    } else {
+        perror("open");
+        return 2;
+    }
+}
+
+
+static void usage_ioctl(char *name)
+{
+    printf("Usage: %s fd request [lflag]\n", name);
+    printf("  Call ioctl(fd, request, tty), with tty->c_lflag=lflag\n");
+    printf("  fd (dec), file no.:\n\t STDIN=0, STDOUT=1, STDERR=2 by default (use lsof to check open fd)\n");
+    printf("  request (hex), one of:\n\t TCGETS = %#x  TCSETS = %#x  TCSETSW = %#x  TCSETSF = %#x\n", TCGETS, TCSETS, TCSETSW, TCSETSF);
+    printf("  lflag (hex), OR-ed of:\n\t ECHO = %#x  ICANON = %#x\n", ECHO, ICANON);
 }
 
 static int main_ioctl(int argc, char *argv[])
 {
-    if (argc < 4) {
-        printf("Usage: %s fd cmd lflag\n",argv[0]);
-        printf("  Call ioctl(fd, cmd, tty), with tty->c_lflag=lflag\n");
-        printf("  fd (dec), file no.:\n\t STDIN=0, STDOUT=1, STDERR=2 by default\n");
-        printf("  cmd (hex), one of:\n\t TCGETS = %#x  TCSETS = %#x  TCSETSW = %#x  TCSETSF = %#x\n", TCGETS, TCSETS, TCSETSW, TCSETSF); 
-        printf("  lflag (hex), OR-ed of:\n\t ECHO = %#x  ICANON = %#x\n", ECHO, ICANON); 
+    if (argc < 3) {
+        usage_ioctl(argv[0]);
         return -1;
     }
 
     int fd = atoi(argv[1]);
-    int cmd = strtol(argv[2], NULL, 16);
-    int lflag = strtol(argv[3], NULL, 16);
+    unsigned long request = strtol(argv[2], NULL, 16);
 
     struct termios t;
-    // Read current termios
-    int res = ioctl(fd, TCGETS, &t);
-
-    if (res == 0) { // ioctl returns 0 if OK (no errors) 
-        res = -1;
-        if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
-            // Set o unset flag echo
-            if (lflag & ECHO) 
-                t.c_lflag |= ECHO;
-            else
-                t.c_lflag &= ~ECHO;
-            // Set o unset flag icanon 
-            if (lflag & ICANON) 
-                t.c_lflag |= ICANON;
-            else
-                t.c_lflag &= ~ICANON;
-            // Set terminal attributes 
-            res = ioctl(fd, cmd, &t);
-        } 
-        else if (cmd == TCGETS) {
-            fprintf(stdout, "lflags=%#x echo=%d icanon=%d\n", t.c_lflag, t.c_lflag & ECHO, t.c_lflag & ICANON);
-            res = 0; // if we are here previous TCGETS was ok
+    if (request == TCSETS || request == TCSETSW || request == TCSETSF) {
+        if (argc < 4) {
+            fprintf(stderr, "requests TCSETS, TCSETSW and TCSETSF requires lflag argument\n");
+            usage_ioctl(argv[0]);
+            return -1;
         }
+        t.c_lflag = strtol(argv[3], NULL, 16);
     }
 
-    return res;
+    if (ioctl(fd, request, &t) == -1) {
+        perror("ioctl");
+        return -1;
+    }
+
+    if (request == TCGETS) {
+        printf("lflags=%#x echo=%d icanon=%d\n", t.c_lflag, t.c_lflag & ECHO, t.c_lflag & ICANON);
+    }    
+
+    return 0;
 }
+
 
 static int main_stty(int argc, char *argv[])
 {
@@ -2333,79 +4560,6 @@ static int main_stty(int argc, char *argv[])
     return tcsetattr(fileno(stdin), TCSANOW, &t);
 }
 
-// CRC32 from https://gist.github.com/timepp/1f678e200d9e0f2a043a9ec6b3690635
-//
-// usage: the following code generates crc for 2 pieces of data
-// uint32_t table[256];
-// crc32_generate_table(table);
-// uint32_t crc = crc32_update(table, 0, data_piece1, len1);
-// crc = crc32_update(table, crc, data_piece2, len2);
-// output(crc);
-
-static uint32_t crc32_table[256];
-static void crc32_generate_table(uint32_t* table)
-{
-    uint32_t polynomial = 0xEDB88320;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (size_t j = 0; j < 8; j++) {
-            if (c & 1) {
-                c = polynomial ^ (c >> 1);
-            }
-            else {
-                c >>= 1;
-            }
-        }
-        table[i] = c;
-    }
-}
-
-static uint32_t crc32_update(uint32_t* table, uint32_t initial, const void* buf, size_t len)
-{
-    uint32_t c = initial ^ 0xFFFFFFFF;
-    const uint8_t* u = (const uint8_t*)(buf);
-    for (size_t i = 0; i < len; ++i) {
-        c = crc32_table[(c ^ u[i]) & 0xFF] ^ (c >> 8);
-    }
-    return c ^ 0xFFFFFFFF;
-}
-
-static uint32_t crc32_compute(const char* filename, int *err)
-{
-    errno =0;
-    *err = 1;
-    static int do_table = 1;
-    if (do_table){
-        crc32_generate_table(crc32_table);
-        do_table = 0;
-    }
-    uint32_t crc = 0;
-    int fh = open(filename, O_RDONLY);
-    if (fh>=0) {
-        uint8_t buff[256];
-        ssize_t r = 1;
-        while ( 0 < (r = read(fh, buff, 256))) {
-            crc = crc32_update(crc32_table, crc, buff, r);
-        }
-        close(fh);
-        if (!errno) {
-            *err = 0;
-        }
-    }
-    return crc;
-}
-
-static int main_crc32(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Compute the CRC32 hash of a file.\nUsage:\n");
-        printf("       %s <filename>\n", argv[0]);
-        return -1;
-    }
-    int err = 1;
-    uint32_t crc = crc32_compute(argv[1], &err);
-    if (!err) printf("%08x\n", crc);
-}
 
 // Tree from https://github.com/kddnewton/tree
 typedef struct {
@@ -2423,8 +4577,7 @@ typedef struct entry {
     struct entry *next;
 } entry_t;
 
-static int walk(const char* directory, const char* prefix, counter_t *counter)
-{
+static int walk(const char* directory, const char* prefix, counter_t *counter) {
     entry_t *head = NULL, *current, *iter;
     size_t size = 0, index;
 
@@ -2446,7 +4599,7 @@ static int walk(const char* directory, const char* prefix, counter_t *counter)
             (file_dirent->d_name[1] == '.' && file_dirent->d_name[2] == '\0')))) {  // '..'
             continue;
         }
-
+        
 
         char *name = file_dirent->d_name;
         current = (entry_t*)malloc(sizeof(entry_t));
@@ -2490,7 +4643,6 @@ static int walk(const char* directory, const char* prefix, counter_t *counter)
     }
 
     for (index = 0; index < size; index++) {
-
         #define TREE_US_ASCII_
         #ifdef TREE_US_ASCII
         if (index == size - 1) {
@@ -2503,10 +4655,10 @@ static int walk(const char* directory, const char* prefix, counter_t *counter)
         #else
         if (index == size - 1) {
             pointer = "└── ";
-            segment = "    ";
+           segment = "    ";
         } else {
             pointer = "├── ";
-            segment = "│   ";
+            segment = "│  ";
         }
         #endif
 
@@ -2574,6 +4726,8 @@ static int main_tree(int argc, char *argv[]) {
   return 0;
 }
 
+
+// ROAE SHELL COMMANDS
 extern int IDA_siard2sql(const char*, const char*, const char*);
 static void help_siard(int argc, char *argv[]) {
     printf("Usage: %s tosql <siard file>   sqlitefile.sql\n",argv[0]);
@@ -3038,670 +5192,48 @@ static int main_roae(int argc, char *argv[]) {
     }
     return 0;
 }
+// END ROAE SHELL COMMANDS
 
 
-#ifdef __ivm64__
-// Some external functions: they must be overridden when compiling its source file first
-// spawn.c:
- __attribute__((noinline)) int ivm_spawn(int argc, char *argv[]){asm volatile(""); return -1;}
 
-// Some debugging functions; they must be overridden
-// when compiling ivmfs.c first
- __attribute__((noinline)) void  debug_print_file_table(){asm volatile(""); return; }
- __attribute__((noinline)) void  debug_print_open_file_table(){asm volatile(""); return;}
- __attribute__((noinline)) int   debug_has_trail(char *a){asm volatile(""); return 0;}
- __attribute__((noinline)) char* debug_remove_trail2(char *a, char *b, char *c){asm volatile(""); return NULL;}
- __attribute__((noinline)) char* debug_realpath_nocheck(char *a, char *b){asm volatile(""); return NULL;}
- __attribute__((noinline)) char* debug_realparentpath(char *a, char *b){asm volatile(""); return NULL;}
- __attribute__((noinline)) long debug_get_spawnlevel(){asm volatile(""); return -1;};
- __attribute__((noinline)) void* debug_get_errno_p(){asm volatile(""); return NULL;};
-#endif
+static int main_spawn(int argc, char *argv[])
+{
+    int ret = 0;
+    #ifdef __ivm64__
+        ret = ivm_spawn(argc, argv);
+    #else
+        pid_t pid = fork();
+        if (pid == 0) {
+            execv(argv[0], argv);
+            perror("exec");
+            exit(EXIT_FAILURE);
+        } else if (pid > 0) {
+            int wstatus;
+            wait(&wstatus);
+            ret = WEXITSTATUS(wstatus);
+        } else{
+            perror("fork");
+            ret = -1;
+        }
+    #endif
+    //fprintf(stderr, "spawn returned %d\n", ret);
+    return ret;
+}
 
 static int main_help(int argc, char *argv[])
 {
-    printf("Immortal Database Access (iDA) EUROSTARS project\n"
-           "ROAE shell, %s: "
-           "A shell to interface with the Read-Only Access Engine (ROAE)\n", ROAESHELL_VERSION);
+    printf( "Immortal Database Access (iDA) EUROSTARS project\n"
+            "ROAE shell, %s: "
+            "A shell to interface with the Read-Only Access Engine (ROAE)\n", ROAESHELL_VERSION);
 
-    printf("\n"
-           "File system commands:\n"
-           "   basename cat cd chmod close closedir cp crc32 dd dir dup dup2 dirname echo\n"
-           "   exit(=quit)(=^D) fcd find free fstat ftruncate getenv glob help ls lseek lsof lstat\n"
-           "   mkdir mkdirat mkstemp mkdtemp mv open openat opendir prompt pwd\n"
-           "   read readlink readlinkat realpath rename renameat rm(=unlink) rmdir seekdir\n"
-           "   setenv source spawn stat stty symlink(=ln) symlinkat touch tree truncate\n"
-           "   type unlinkat unsetenv write writef\n"
-           "Available redirections:\n"
-           "   '> file', ' 2> file', ' >> file', ' < file', ' << HEREDOC'\n"
-           "IDA commands:\n"
-           "   roae siard sqlite unzip\n"
+    printf( "IDA commands:\n   roae\n   siard\n   sqlite\n   unzip\n"
+            "Available redirections:\n"
+            "   ' > file', ' 2> file', ' >> file', ' < file', ' << HEREDOC', ' <<<\'string\'' \n"
+            "FS commands: argv basename cat cd chmod cmp cp crc32 dd du dir dirname echo env exit export find glob grep help hexdump\n"
+            "             ln ls lsof meminfo mkdir mv pwd quit(=^D) readlink realpath rm rmdir seekdir set source stat tee touch tree\n"
+            "             truncate type umask unset wc writechars\n"
+            "Functions: close dup dup2 fchmod fchmodat fcmp ftruncate linkat lseek open openat read rename renameat write\n"
+            "Pseudopipes: 'cmd1 | cmd2 | cmd3 ... '\n"
           );
     return 0;
-}
-
-
-static void set_prompt(int p) {
-    prompt = p;
-}
-
-static int get_prompt() {
-    return prompt;
-}
-
-// -----------------------------------------------------------------------
-//                            MAIN
-// -----------------------------------------------------------------------
-int main(void)
-{
-	char inputBuffer[MAX_LINE]; /* buffer to hold the command entered */
-	char separator = 0;         /* equals ';' or '&' if executing a subcommand ended by ';' or '&', otherwise is 0*/
-    int argc;
-	char *args[MAX_LINE/2];     /* command line (of 256) has max of 128 arguments */
-	int status = 0;             /* status returned by command */
-
-    char *file_in = NULL, *file_out = NULL, *file_out_append= NULL, *file_err = NULL;
-    char *file_in_heredoc = NULL;
-
-    // Initialize sqlite shell
-    sqlite_shell_init();
-
-    //setvbuf(stdin, NULL, _IOLBF, MAX_LINE);
-
-    status = main_help(0, NULL);
-    puts("");
-
-    char currwd[PATH_MAX];
-
-    // Termios tty configuration, use ICANON|ECHO if the tty
-    // where running this program has not ICANON nor ECHO.
-    struct termios tty;
-    ioctl(STDIN_FILENO, TCGETS, &tty);
-    tty.c_lflag |= ICANON | ECHO;     // enable emulation of icanon and echo
-    //tty.c_lflag &= ~ICANON & ~ECHO; // disable emulation of icanon and echo
-    tty.c_cc[VMIN] = 1;
-    tty.c_cc[VTIME] = 0;
-    ioctl(STDIN_FILENO, TCSETS, &tty);
-
-	while (1)   /* Program terminates normally inside get_command() after ^D is typed*/
-	{   		
-        // Restore standard input/output streams after redirection
-        if (file_in && stdin_0 != -1) {
-            fclose(stdin);
-            dup2(stdin_0,  STDIN_FILENO);
-            stdin = fdopen(STDIN_FILENO, "r");
-            close(stdin_0);
-            stdin_0 = -1;
-            file_in = NULL;
-            //if (isatty(STDIN_FILENO)) clearerr(stdin);
-        }
-        if ((file_out || file_out_append) && stdout_0 != -1) {
-            fclose(stdout);
-            dup2(stdout_0, STDOUT_FILENO);
-            stdout = fdopen(STDOUT_FILENO, "a");
-            close(stdout_0);
-            stdout_0 = -1;
-            file_out = NULL;
-            file_out_append = NULL;
-        }
-        if (file_err && stderr_0 != -1) {
-            fclose(stderr);
-            dup2(stderr_0, STDERR_FILENO);
-            stderr = fdopen(STDERR_FILENO, "a");
-            close(stderr_0);
-            stderr_0 = -1;
-            file_err = NULL;
-        }
-        if (file_in_heredoc && stdin_0 != -1) {
-            fclose(stdin);
-            dup2(stdin_0,  STDIN_FILENO);
-            stdin = fdopen(STDIN_FILENO, "r");
-            close(stdin_0);
-            stdin_0 = -1;
-            file_in_heredoc = NULL;
-        }
-
-        // Only print prompt if we are in a tty and for commands ended by
-        // newline in a sequence of (sub-)commands separated by ';' or '&'
-        if (isatty(STDIN_FILENO) && (separator == '\n' || !separator)) {
-            char *wd;
-            switch (prompt) {
-                case 0: // No prompt
-                        break;
-                case 1: // Fixed prompt
-                        printf("PROMPT> ");
-                        break;
-                case 2: //Current work directory
-                default:
-                        wd = getcwd(currwd, PATH_MAX);
-                        //getwd(currwd);  // deprecated
-                        currwd[PATH_MAX-1]='\0';
-                        if (chdir(currwd)){
-                            printf("ivmfs:%s> ", "(unknown dir, perhaps moved)");
-                        } else {
-                            printf("ivmfs:%s> ", wd);
-                        }
-                        break;
-            }
-        }
-        fflush(NULL);
-
-        /* get next command */
-		argc = get_command(inputBuffer, MAX_LINE, args, &separator);
-
-        // Argument postprocessing
-        // ignore_comments(&argc, args);
-        replace_status(argc, args, status); // Parse $? symbol
-        replace_env(argc, args);            // Parse environment variables (e.g. $ENV) 
-        parse_redirections(args, &argc, &file_in, &file_out, &file_out_append, &file_err, &file_in_heredoc);
-
-        // Avoid loops in redirections, e.g. "cat < a.txt >> a.txt"
-        if ((file_in && file_out && is_same_file(file_in, file_out))
-             || (file_in && file_err && is_same_file(file_in, file_err))
-             || (file_in && file_out_append && is_same_file(file_in, file_out_append))
-           ) {
-            fprintf(stderr, "input file is output file\n");
-            continue;
-        }
-
-
-        // Do redirections
-        // TODO: check errors in redirection
-        FILE *fh;
-        if (file_in){
-            fh = fopen(file_in, "r");
-            if (fh) {
-                fflush(stdin);
-                stdin_0  = dup(STDIN_FILENO);
-                dup2(fileno(fh), STDIN_FILENO);
-                fclose(fh);
-            }
-            else{
-                perror("Error in stdin redirection '<'");
-                status = -1;
-                continue;
-            }
-        }
-
-        if (file_out){
-            fh = fopen(file_out, "w");
-            if (fh) {
-                stdout_0 = dup(STDOUT_FILENO);
-                dup2(fileno(fh), STDOUT_FILENO);
-                fclose(fh);
-            }
-            else{
-                perror("Error in stdout redirection '>'");
-                status = -1;
-                continue;
-            }
-        }
-
-        if (file_out_append){
-            fh = fopen(file_out_append, "a");
-            if (fh) {
-                stdout_0 = dup(STDOUT_FILENO);
-                dup2(fileno(fh), STDOUT_FILENO);
-                fclose(fh);
-            }
-            else{
-                perror("Error in append redirection '>>'");
-                status = -1;
-                continue;
-            }
-        }
-
-        if (file_err){
-            fh = fopen(file_err, "w");
-            if (fh) {
-                stderr_0 = dup(STDERR_FILENO);
-                dup2(fileno(fh), STDERR_FILENO);
-                fclose(fh);
-            }
-            else{
-                perror("Error in stderr redirection '2>'");
-                status = -1;
-                continue;
-            }
-        }
-
-        if (file_in_heredoc){
-            int hderror = 0;
-            int tmpfd = heredoc_open(file_in_heredoc);
-            if(tmpfd > 0) {
-                fflush(stdin); // clear buffer before dup
-                stdin_0  = dup(STDIN_FILENO);
-                dup2(tmpfd, STDIN_FILENO);
-                close(tmpfd);
-            } else {
-                fprintf(stderr, "Error in heredoc redirection '<<'\n");
-                status = -1;
-                continue;
-            }
-        }
-
-        // Process command and arguments
-
-		if(args[0]==NULL) continue;   // if empty command
-
-        if (!strcmp("c", args[0])){
-            status = main_countargs(argc, args);
-            continue;
-        }
-
-        if (!strcmp("pwd", args[0])) {
-            status = main_pwd(argc, args);
-            continue;
-        }
-
-        if (!strcmp("cd", args[0])) {
-            status = main_cd(argc, args);
-            continue;
-        }
-
-        if (!strcmp("fcd", args[0])) {
-            status = main_fcd(argc, args);
-            continue;
-        }
-
-        if (!strcmp("ls", args[0])) {
-            status = main_ls(argc, args);
-            continue;
-        }
-
-        if (!strcmp("dir", args[0])) {
-            status = main_dir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("seekdir", args[0]) || !strcmp("sd", args[0])) {
-            status = main_seekdir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("mkdir", args[0])){
-            status = main_mkdir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("mkdirat", args[0])){
-            status = main_mkdirat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("glob", args[0])){
-            status = main_glob(argc, args);
-            continue;
-        }
-
-        if (!strcmp("setenv", args[0])){
-            status = main_setenv(argc, args);
-            continue;
-        }
-
-        if (!strcmp("unsetenv", args[0])){
-            status = main_unsetenv(argc, args);
-            continue;
-        }
-
-        if (!strcmp("getenv", args[0])){
-            status = main_getenv(argc, args);
-            continue;
-        }
-
-        if (!strcmp("env", args[0])){
-            status = main_env(argc, args);
-            continue;
-        }
-
-        if (!strcmp("realpath", args[0]) || !strcmp("rp", args[0])){
-            status = main_realpath(argc, args);
-            continue;
-        }
-
-        if (!strcmp("cat", args[0])){
-            status = main_cat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("type", args[0])){
-            status = main_type(argc, args);
-            continue;
-        }
-
-        if (!strcmp("cp", args[0])){
-            status = main_cp(argc, args);
-            continue;
-        }
-
-        if (!strcmp("dd", args[0])){
-            status = main_dd(argc, args);
-            continue;
-        }
-
-        if (!strcmp("stat", args[0]) || !strcmp("lstat", args[0]) || !strcmp("fstat", args[0])){
-            status = main_stat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("echo", args[0])){
-            status = echo(argc, args);
-            continue;
-        }
-
-        if (!strcmp("rm", args[0]) || !strcmp("unlink", args[0])){
-            status = main_unlink(argc, args);
-            continue;
-        }
-
-        if (!strcmp("unlinkat", args[0])){
-            status = main_unlinkat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("symlink", args[0]) || !strcmp("ln", args[0])){
-            status = main_symlink(argc, args);
-            continue;
-        }
-
-        if (!strcmp("symlinkat", args[0])){
-            status = main_symlinkat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("basename", args[0]) || !strcmp("bn", args[0])){
-            status = bn(args[1]);
-            continue;
-        }
-
-        if (!strcmp("dirname", args[0]) || !strcmp("dn", args[0])){
-            status = dn(args[1]);
-            continue;
-        }
-
-        if (!strcmp("readlink", args[0]) || !strcmp("rl", args[0])){
-            status = main_readlink(argc, args);
-            continue;
-        }
-
-        if (!strcmp("readlinkat", args[0])){
-            status = main_readlinkat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("touch",args[0])){
-            status = main_touch(argc, args);
-            continue;
-        }
-
-        if (!strcmp("mv", args[0])){
-            status = main_mv(argc, args);
-            continue;
-        }
-
-        if (!strcmp("rename", args[0]) || !strcmp("rn", args[0])){
-            status = main_rename(argc, args);
-            continue;
-        }
-
-        if (!strcmp("renameat", args[0])){
-            status = main_renameat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("read", args[0])){
-            status = main_read(argc, args);
-            continue;
-        }
-
-        if (!strcmp("write", args[0])){
-            status = main_write(argc, args);
-            continue;
-        }
-
-        if (!strcmp("writef", args[0])){
-            status = main_writef(argc, args);
-            continue;
-        }
-
-        if (!strcmp("truncate", args[0])){
-            status = main_truncate(argc, args);
-            continue;
-        }
-
-        if (!strcmp("ftruncate", args[0])){
-            status = main_ftruncate(argc, args);
-            continue;
-        }
-
-        if (!strcmp("rmdir", args[0])){
-            status = main_rmdir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("open", args[0])){
-            status = main_open(argc, args);
-            continue;
-        }
-
-        if (!strcmp("openat", args[0])){
-            status = main_openat(argc, args);
-            continue;
-        }
-
-        if (!strcmp("close", args[0])){
-            status = main_close(argc, args);
-            continue;
-        }
-
-        if (!strcmp("lseek", args[0])) {
-            status = main_lseek(argc, args);
-            continue;
-        }
-
-        if (!strcmp("dup", args[0])){
-            status = main_dup(argc, args);
-            continue;
-        }
-
-        if (!strcmp("dup2", args[0])){
-            status = main_dup2(argc, args);
-            continue;
-        }
-
-        if (!strcmp("opendir", args[0])){
-            status = main_opendir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("closedir", args[0])){
-            status = main_closedir(argc, args);
-            continue;
-        }
-
-        if (!strcmp("tree", args[0])){
-            status = main_tree(argc, args);
-            continue;
-        }
-
-        if (!strcmp("du", args[0])){
-            status = main_du(argc, args);
-            continue;
-        }
-
-        if (!strcmp("free", args[0])){
-            status = main_free(argc, args);
-            continue;
-        }
-
-        if (!strcmp("mkstemp", args[0])){
-            status = main_mkstemp(argc, args);
-            continue;
-        }
-
-        if (!strcmp("mkdtemp", args[0])){
-            status = main_mkdtemp(argc, args);
-            continue;
-        }
-
-        if (!strcmp("chmod", args[0])){
-            status = main_chmod(argc, args);
-            continue;
-        }
-
-        if (!strcmp("lsof", args[0])){
-            status = main_lsof(argc, args);
-            continue;
-        }
-
-        if (!strcmp("spawn", args[0])){
-            status = main_spawn(argc, args);
-            continue;
-        }
-
-        if (!strcmp("source", args[0])|| !strcmp(".", args[0])){
-            status = main_source(argc, args);
-            continue;
-        }
-
-        if (!strcmp("ioctl", args[0])){
-            status = main_ioctl(argc, args);
-            continue;
-        }
-
-        if (!strcmp("stty", args[0])){
-            status = main_stty(argc, args);
-            continue;
-        }
-
-        if (!strcmp("prompt", args[0])){
-            if (argc == 1) {
-                printf("Usage: %s <mode>\n\t0:no prompt; 1:fixed; 2:cwd\n", args[0]);
-            } else {
-                set_prompt(atoi(args[1]));
-            }
-            continue;
-        }
-
-        if (!strcmp("crc32", args[0])){
-            status = main_crc32(argc, args);
-            continue;
-        }
-
-        extern int main_find(int argc, char** args);
-        if (!strcmp("find", args[0])){
-            status = main_find(argc, args);
-            continue;
-        }
-
-        extern int main_grep(int argc, char** args);
-        if (!strcmp("grep", args[0])){
-            status = main_grep(argc, args);
-            continue;
-        }
-
-        if (!strcmp("sqlite", args[0])){
-            status = main_sqlite(argc, args);
-            continue;
-        }
-
-        if (!strcmp("roae", args[0])){
-            status = main_roae(argc, args);
-            continue;
-        }
-
-        if (!strcmp("siard", args[0])){
-            status = main_siard(argc, args);
-            continue;
-        }
-
-        if (!strcmp("unzip", args[0])){
-            status = main_unzip(argc, args);
-            continue;
-        }
-
-        if (!strcmp("help", args[0])){
-            status = main_help(argc, args);
-            continue;
-        }
-
-        if (!strcmp("exit", args[0]) || !strcmp("quit", args[0])){
-            fprintf(stderr, "exit\n");
-            int ret = 0;
-            if (args[1]) ret = atoi(args[1]);
-            exit(ret);
-        }
-
-
-        //---------------------------- Some debugging commands
-        #ifdef __ivm64__
-        if (!strcmp("t", args[0])){
-            debug_print_file_table();
-            puts("");
-            continue;
-        }
-
-        if (!strcmp("ot", args[0])){
-            debug_print_open_file_table();
-            puts("");
-            continue;
-        }
-
-        if (!strcmp("ht", args[0])){
-            if (argc > 1) printf("%s\n", debug_has_trail(args[1])?"true":"fase");
-            continue;
-        }
-
-        if (!strcmp("rt2", args[0])){
-            char path_copy[PATH_MAX], trail[PATH_MAX];
-            if (argc > 1){
-                 debug_remove_trail2(args[1], path_copy, trail);
-                 printf("%s\n%s\n", path_copy, trail);
-            }
-            continue;
-        }
-
-        if (!strcmp("rpnchk", args[0])){
-            char buff[PATH_MAX], *rl;
-            if (argc > 1) {
-                rl = debug_realpath_nocheck(args[1], buff);
-                fprintf(stdout, "%s\n", rl);
-            }
-            continue;
-        }
-
-        if (!strcmp("rpp", args[0])){
-            char buff[PATH_MAX], *rl;
-            if (argc > 1) {
-                rl = debug_realparentpath(args[1], buff);
-                fprintf(stdout, "%s\n", rl);
-            }
-            continue;
-        }
-
-        if (!strcmp("spwl", args[0])){
-            // Print spawn level
-            long curlevel;
-            curlevel = debug_get_spawnlevel();
-            printf("current spawn level=%ld\n", curlevel);
-            continue;
-        }
-
-        if (!strcmp("errno", args[0])){
-            // Print current errno address 
-            printf("&errno=%p\n", debug_get_errno_p());
-            continue;
-        }
-
-        #endif
-
-        if (access(args[0], X_OK) == 0) {
-            // Try to spawn if it is an existing file
-            argc = arg_add(argc, args, "spawn");
-            status = main_spawn(argc, args);
-            continue;
-        }
-
-        fprintf(stderr, "Command '%s' not found\n", args[0]);
-        status = -1;
-	} // end while
 }

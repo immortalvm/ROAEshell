@@ -2920,7 +2920,6 @@ static int main_rmdir(int argc, char *argv[])
     return 0;
 }
 
-#ifdef __ivm64__
 // Recursive rm (like rm -rf)
 // To be safer, only path whose realpath contains needle are deleted
 static int rrm_needle(char *path, char *needle)
@@ -3000,7 +2999,6 @@ static int rrm(char *path)
 {
     return rrm_needle(path, NULL);
 }
-#endif
 
 static int main_rm(int argc, char *argv[])
 {

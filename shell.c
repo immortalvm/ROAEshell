@@ -31,6 +31,7 @@
 #include <glob.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <stdint.h>
 
 #define MAX_LINE 4096
 
